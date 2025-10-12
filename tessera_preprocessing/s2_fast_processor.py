@@ -23,7 +23,14 @@ import numpy as np
 import psutil, rasterio, xarray as xr, rioxarray
 from rasterio.enums import Resampling
 from rasterio.warp import transform_bounds, reproject
-import pystac_client, planetary_computer, stackstac
+import pystac_client, stackstac
+# Planetary Computer is optional; only needed when explicitly requested
+try:
+    import planetary_computer  # type: ignore
+    _HAS_PC = True
+except Exception:
+    planetary_computer = None  # type: ignore
+    _HAS_PC = False
 
 import dask
 from dask.distributed import Client, LocalCluster, performance_report, wait
@@ -70,6 +77,49 @@ SCL_DESCRIPTIONS = {
     10: "Thin cirrus",
     11: "Snow"
 }
+
+# Helper: map logical band name (e.g., "B02" or "SCL") to the actual
+# STAC asset key present in the items. This allows us to work with both
+# Microsoft Planetary Computer (B02/B03/.../SCL) and AWS Earth Search
+# (blue/green/.../scl) transparently.
+def resolve_asset_name(logical_name: str, items) -> str:
+    """Return an asset key that exists on the provided items.
+
+    logical_name can be one of BAND_MAPPING keys (B02..B12, B8A, SCL).
+    We probe common variants against the first item (and fall back to
+    scanning all items) to find a matching asset key.
+    """
+    # Candidate keys to try (order matters): logical (B02) and mapped (blue),
+    # with case variants to be robust across catalogs
+    cand_base = [logical_name]
+    mapped = BAND_MAPPING.get(logical_name)
+    if mapped and mapped not in cand_base:
+        cand_base.append(mapped)
+
+    candidates = []
+    for c in cand_base:
+        candidates.extend([c, c.lower(), c.upper()])
+
+    def pick_from_item(item):
+        for c in candidates:
+            if c in getattr(item, 'assets', {}):
+                return c
+        return None
+
+    # Prefer probing the first item
+    if items:
+        chosen = pick_from_item(items[0])
+        if chosen:
+            return chosen
+        # Fallback: probe all items just in case
+        for it in items:
+            chosen = pick_from_item(it)
+            if chosen:
+                return chosen
+
+    # If nothing matched, last resort: return logical_name to let downstream raise
+    logging.warning(f"No matching asset key found for {logical_name}; tried {set(candidates)}. Using {logical_name}.")
+    return logical_name
 
 # Valid coverage threshold (skip processing below this value)
 MIN_VALID_COVERAGE = 5.0  # percentage
@@ -140,6 +190,13 @@ def get_args():
                    help="Partition ID (for log identification)")
     P.add_argument("--temp_dir",     default=TEMP_DIR,
                    help="Temporary file storage directory, default uses system temp directory")
+    # STAC configuration (defaults to AWS Earth Search v1 / Sentinel-2 L2A)
+    P.add_argument("--stac_endpoint", default="https://earth-search.aws.element84.com/v1",
+                   help="STAC API endpoint (default: AWS Earth Search v1)")
+    P.add_argument("--stac_collection", default="sentinel-2-l2a",
+                   help="STAC collection id (default: sentinel-2-l2a)")
+    P.add_argument("--use_planetary_computer", action="store_true",
+                   help="Use Microsoft Planetary Computer with request signing (overrides --stac_endpoint)")
     return P.parse_args()
 
 # ─── logging ──────────────────────────────────────────────────────────────────
@@ -251,7 +308,10 @@ def mask_to_xr(mask_np, tpl):
     return da.rio.write_crs(tpl["crs"]).rio.write_transform(tpl["transform"])
 
 # ─── STAC ─────────────────────────────────────────────────────────────────────
-def search_items(bbox_ll, date_range:str, max_cloud, partition_id: str):
+def search_items(bbox_ll, date_range:str, max_cloud, partition_id: str,
+                 stac_endpoint: str,
+                 stac_collection: str,
+                 use_planetary_computer: bool=False):
     """
     Search STAC items with enhanced exception handling and retry logic
     """
@@ -277,10 +337,21 @@ def search_items(bbox_ll, date_range:str, max_cloud, partition_id: str):
     
     while retries <= max_retries:
         try:
-            cat = pystac_client.Client.open(
-                "https://planetarycomputer.microsoft.com/api/stac/v1",
-                modifier=planetary_computer.sign_inplace)
-            q = cat.search(collections=["sentinel-2-l2a"],
+            # Choose STAC provider: Planetary Computer (signed) or generic endpoint (default: AWS Earth Search)
+            if use_planetary_computer:
+                if not _HAS_PC:
+                    raise RuntimeError("planetary-computer package not installed; cannot use --use_planetary_computer.")
+                cat = pystac_client.Client.open(
+                    "https://planetarycomputer.microsoft.com/api/stac/v1",
+                    modifier=planetary_computer.sign_inplace)
+                eff_endpoint = "https://planetarycomputer.microsoft.com/api/stac/v1"
+            else:
+                eff_endpoint = stac_endpoint or "https://earth-search.aws.element84.com/v1"
+                cat = pystac_client.Client.open(eff_endpoint)
+
+            logging.info(f"[{partition_id}] STAC endpoint: {eff_endpoint} | collection: {stac_collection}")
+
+            q = cat.search(collections=[stac_collection],
                        bbox=bbox_ll, datetime=search_date_range,
                        query={"eo:cloud_cover": {"lt": max_cloud}})
             items = list(q.get_items())
@@ -648,10 +719,28 @@ def process_band(items, band_name, date_key, tpl, bbox_proj, mask_np, tile_selec
         try:
             with timeout_handler(BAND_TIMEOUT):
                 # Use stackstac.stack to load single band
-                assets = [band_name]
+                # Resolve asset key to support both MPC (e.g., "B02") and AWS Earth Search (e.g., "blue")
+                asset_key = resolve_asset_name(band_name, items)
+                assets = [asset_key]
+                # Filter to items that actually contain this asset and log partial discards
+                n_before = len(items)
+                band_items = [it for it in items if asset_key in getattr(it, 'assets', {})]
+                n_after = len(band_items)
+                stats = {"band": band_name, "asset_key": asset_key, "n_before": n_before, "n_after": n_after}
+                if n_after < n_before:
+                    dropped = n_before - n_after
+                    frac = dropped / max(1, n_before)
+                    level = logging.WARNING if frac > 0.25 else logging.INFO
+                    logging.log(level, f"[{partition_id}]     {dropped} of {n_before} items missing '{asset_key}' for {band_name}; using {n_after}")
+                    if logging.getLogger().isEnabledFor(logging.DEBUG):
+                        missing_ids = [getattr(it, 'id', 'unknown') for it in items if asset_key not in getattr(it, 'assets', {})]
+                        logging.debug(f"[{partition_id}]     Items missing '{asset_key}' ({band_name}): {missing_ids}")
+                if not band_items:
+                    logging.warning(f"[{partition_id}]     No items contain '{asset_key}' for {band_name}; skipping band")
+                    return False, stats
                 
                 da = stackstac.stack(
-                    items=items,
+                    items=band_items,
                     assets=assets,
                     resolution=res,
                     epsg=tpl["crs"].to_epsg(),
@@ -671,7 +760,7 @@ def process_band(items, band_name, date_key, tpl, bbox_proj, mask_np, tile_selec
                             da = da.squeeze(dim, drop=True)
                 
                 # Extract band data
-                band_da = da.sel(band=band_name)
+                band_da = da.sel(band=asset_key)
                 
                 # Convert to numpy array for processing
                 if item_dim:
@@ -685,7 +774,7 @@ def process_band(items, band_name, date_key, tpl, bbox_proj, mask_np, tile_selec
                     # Check if array size is reasonable
                     if not check_memory_requirements(band_arr.shape, band_arr.dtype):
                         logging.warning(f"[{partition_id}]     {band_name} array too large, skipping")
-                        return False
+                        return False, stats
                     
                     # Apply SCL-based smart mosaic - vectorized version
                     if tile_selection is not None:
@@ -761,7 +850,7 @@ def process_band(items, band_name, date_key, tpl, bbox_proj, mask_np, tile_selec
                     "TIFFTAG_DATETIME": datetime.datetime.now().strftime("%Y:%m:%d %H:%M:%S"),
                     "DATE_ACQUIRED": date_key,
                     "BAND_NAME": band_name,
-                    "ITEMS_COUNT": len(items)
+                    "ITEMS_COUNT": len(band_items)
                 }
                 
                 # Write GeoTIFF
@@ -779,7 +868,7 @@ def process_band(items, band_name, date_key, tpl, bbox_proj, mask_np, tile_selec
                             f"{os.path.getsize(out_path)/1e6:.2f} MB, time {time.time()-t0:.1f}s")
                 
                 # Successfully completed
-                return True
+                return True, stats
                 
         except TimeoutException as e:
             if attempt < retries:
@@ -788,7 +877,7 @@ def process_band(items, band_name, date_key, tpl, bbox_proj, mask_np, tile_selec
                 time.sleep(retry_delay)
             else:
                 logging.error(f"[{partition_id}]     ✗ Band {band_name} processing timeout: {e}")
-                return False
+                return False, stats
                 
         except Exception as e:
             if attempt < retries:
@@ -797,10 +886,10 @@ def process_band(items, band_name, date_key, tpl, bbox_proj, mask_np, tile_selec
                 time.sleep(retry_delay)
             else:
                 logging.error(f"[{partition_id}]     ✗ Band {band_name} processing failed: {e}")
-                return False
+                return False, stats
 
         # All retries failed
-        return False
+        return False, stats
 
 # ─── Process SCL Assessment and Band Generation ───────────────────────────────────────────────────────────
 def process_scl_assessment_and_generation(items, date_key, tpl, bbox_proj, mask_np, res, chunksize,
@@ -864,23 +953,31 @@ def process_scl_assessment_and_generation(items, date_key, tpl, bbox_proj, mask_
                 logging.warning(f"[{partition_id}]   Error analyzing existing SCL file: {e}, will regenerate")
                 scl_out_path.unlink()
 
-    # Check if SCL assets are included in items
-    if not all('SCL' in item.assets for item in items):
-        logging.warning(f"[{partition_id}]   Some items missing SCL assets, trying to use only available SCL")
-        # Filter items with SCL assets
-        scl_items = [item for item in items if 'SCL' in item.assets]
-        if not scl_items:
-            logging.warning(f"[{partition_id}]   All items missing SCL assets, cannot perform quality assessment!")
-            # Return failure result
-            return False, 0.0, None
-        items = scl_items
+    # Resolve the SCL asset key across providers (PC: "SCL"; AWS: "scl")
+    scl_asset_key = resolve_asset_name("SCL", items)
+    # Keep only items that actually have the chosen SCL asset
+    n_before = len(items)
+    scl_items = [item for item in items if scl_asset_key in getattr(item, 'assets', {})]
+    n_after = len(scl_items)
+    if n_after < n_before:
+        dropped = n_before - n_after
+        frac = dropped / max(1, n_before)
+        level = logging.WARNING if frac > 0.25 else logging.INFO
+        logging.log(level, f"[{partition_id}]   {dropped} of {n_before} items missing '{scl_asset_key}'; using {n_after}")
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            missing_ids = [getattr(it, 'id', 'unknown') for it in items if scl_asset_key not in getattr(it, 'assets', {})]
+            logging.debug(f"[{partition_id}]   Items missing '{scl_asset_key}': {missing_ids}")
+    if not scl_items:
+        logging.warning(f"[{partition_id}]   No items contain SCL asset; cannot perform quality assessment!")
+        return False, 0.0, None
+    items = scl_items
 
     try:
         with timeout_handler(SCL_BAND_TIMEOUT):
             # Use stackstac.stack to load SCL band
             da = stackstac.stack(
                 items=items,
-                assets=['SCL'],
+                assets=[scl_asset_key],
                 resolution=res,
                 epsg=tpl["crs"].to_epsg(),
                 bounds=bbox_proj,
@@ -899,7 +996,7 @@ def process_scl_assessment_and_generation(items, date_key, tpl, bbox_proj, mask_
                         da = da.squeeze(dim, drop=True)
             
             # Extract SCL data
-            scl_da = da.sel(band='SCL')
+            scl_da = da.sel(band=scl_asset_key)
             
             # Get numpy array
             scl_arr = scl_da.values
@@ -1036,6 +1133,7 @@ def process_day(date_key:str, items, tpl, bbox_proj, mask_np,
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                     # Submit all tasks
                     futures = {}
+                    band_stats_all = []
                     
                     for band_name in other_bands:
                         out_name = BAND_MAPPING[band_name]
@@ -1062,7 +1160,15 @@ def process_day(date_key:str, items, tpl, bbox_proj, mask_np,
                     for future in concurrent.futures.as_completed(futures):
                         band_name, out_path, temp_path = futures[future]
                         try:
-                            success = future.result()
+                            result = future.result()
+                            # Unpack success + optional stats
+                            if isinstance(result, tuple) and len(result) == 2:
+                                success, stats = result
+                                if stats is not None:
+                                    band_stats_all.append(stats)
+                            else:
+                                success = bool(result)
+                                stats = None
                             if success:
                                 # Check if temporary file is valid
                                 if temp_path.exists() and validate_tiff(temp_path, (tpl["height"], tpl["width"]), tpl["crs"], tpl["transform"]):
@@ -1076,6 +1182,22 @@ def process_day(date_key:str, items, tpl, bbox_proj, mask_np,
                                 logging.warning(f"[{partition_id}]     ✗ {band_name} processing failed")
                         except Exception as e:
                             logging.error(f"[{partition_id}]     ✗ {band_name} processing exception: {e}")
+                    # After all bands, summarize large item drops
+                    try:
+                        large = []
+                        for st in band_stats_all:
+                            nb = st.get('n_before', 0); na = st.get('n_after', 0)
+                            if nb and na < nb:
+                                dropped = nb - na
+                                frac = dropped / nb
+                                if frac > 0.25:
+                                    large.append(f"{st.get('band','?')}({dropped}/{nb})")
+                        if large:
+                            logging.warning(f"[{partition_id}]   Summary: significant missing-asset drops → {', '.join(large)}")
+                        else:
+                            logging.info(f"[{partition_id}]   Summary: no significant missing-asset drops across bands")
+                    except Exception as e:
+                        logging.debug(f"[{partition_id}]   Summary generation error: {e}")
             finally:
                 # Clean up daily temporary directory
                 try:
@@ -1130,13 +1252,20 @@ def main():
     logging.info(f"[{a.partition_id}] SCL assessment attempt count: {SCL_MAX_ATTEMPTS}")
     logging.info(f"[{a.partition_id}] Temporary directory: {TEMP_DIR}")
     logging.info(f"[{a.partition_id}] Processing time period: {a.start_date} → {a.end_date}")
+    if a.use_planetary_computer:
+        logging.info(f"[{a.partition_id}] Using Microsoft Planetary Computer (signed requests)")
+    else:
+        logging.info(f"[{a.partition_id}] STAC endpoint: {a.stac_endpoint} | collection: {a.stac_collection}")
 
     tpl, bbox_proj, bbox_ll, mask_np = load_roi(Path(a.input_tiff), a.partition_id)
 
     # Search STAC items
     search_date_range = f"{a.start_date}/{a.end_date}"
 
-    items = search_items(bbox_ll, search_date_range, a.max_cloud, a.partition_id)
+    items = search_items(
+        bbox_ll, search_date_range, a.max_cloud, a.partition_id,
+        a.stac_endpoint, a.stac_collection, a.use_planetary_computer
+    )
     if not items:
         logging.warning(f"[{a.partition_id}] No images meeting criteria, exiting")
         return
