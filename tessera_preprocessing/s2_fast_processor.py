@@ -9,6 +9,7 @@ Optimization: Uses efficient vectorized operations instead of pixel-by-pixel pro
 
 from __future__ import annotations
 import os, sys, argparse, logging, datetime, time, warnings, signal
+import json, threading
 from pathlib import Path
 import multiprocessing
 from contextlib import contextmanager
@@ -190,6 +191,9 @@ def get_args():
                    help="Partition ID (for log identification)")
     P.add_argument("--temp_dir",     default=TEMP_DIR,
                    help="Temporary file storage directory, default uses system temp directory")
+    # Metrics / instrumentation (opt-in)
+    P.add_argument("--metrics_jsonl", default=None,
+                   help="Append structured JSONL metrics to this file (opt-in, low overhead)")
     # STAC configuration (defaults to AWS Earth Search v1 / Sentinel-2 L2A)
     P.add_argument("--stac_endpoint", default="https://earth-search.aws.element84.com/v1",
                    help="STAC API endpoint (default: AWS Earth Search v1)")
@@ -198,6 +202,87 @@ def get_args():
     P.add_argument("--use_planetary_computer", action="store_true",
                    help="Use Microsoft Planetary Computer with request signing (overrides --stac_endpoint)")
     return P.parse_args()
+
+# ─── Metrics ──────────────────────────────────────────────────────────────────
+class MetricsLogger:
+    """Thread-safe JSONL metrics emitter (very low overhead)."""
+    def __init__(self, path: Path, partition_id: str):
+        self.path = Path(path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        # Open in append, line-buffered
+        self._fh = self.path.open("a", encoding="utf-8")
+        self._lock = threading.Lock()
+        self.partition_id = partition_id
+        self.max_rss_seen = 0
+
+    def _utcnow(self):
+        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+
+    def _proc_tree_sample(self):
+        try:
+            p0 = psutil.Process(os.getpid())
+            procs = [p0] + p0.children(recursive=True)
+        except Exception:
+            return None
+        cpu_user = 0.0; cpu_sys = 0.0; rss_sum = 0; rss_max = 0; n = 0
+        io_read = 0; io_write = 0
+        for p in procs:
+            try:
+                t = p.cpu_times()
+                cpu_user += getattr(t, 'user', 0.0)
+                cpu_sys  += getattr(t, 'system', 0.0)
+                m = p.memory_info()
+                rss_sum += getattr(m, 'rss', 0)
+                rss_max = max(rss_max, getattr(m, 'rss', 0))
+                n += 1
+                try:
+                    io = p.io_counters()
+                    io_read += getattr(io, 'read_bytes', 0)
+                    io_write += getattr(io, 'write_bytes', 0)
+                except Exception:
+                    pass
+            except Exception:
+                continue
+        self.max_rss_seen = max(self.max_rss_seen, rss_max)
+        return {
+            "cpu_user_s": cpu_user,
+            "cpu_sys_s": cpu_sys,
+            "cpu_total_s": cpu_user + cpu_sys,
+            "rss_bytes_sum": rss_sum,
+            "rss_bytes_max": rss_max,
+            "proc_count": n,
+            "io_read_bytes": io_read,
+            "io_write_bytes": io_write,
+            "max_rss_bytes_seen": self.max_rss_seen,
+        }
+
+    def log(self, event: str, **fields):
+        rec = {
+            "ts": self._utcnow(),
+            "event": event,
+            "partition_id": self.partition_id,
+            "pid": os.getpid(),
+        }
+        rec.update(fields)
+        if event in {"run_start", "run_end", "day_start", "day_end"}:
+            rec["proc"] = self._proc_tree_sample()
+        line = json.dumps(rec, ensure_ascii=False)
+        with self._lock:
+            self._fh.write(line + "\n")
+            self._fh.flush()
+
+    def close(self):
+        try:
+            with self._lock:
+                self._fh.close()
+        except Exception:
+            pass
+
+# Global metrics handle (None if disabled)
+METRICS = None  # type: ignore
 
 # ─── logging ──────────────────────────────────────────────────────────────────
 def setup_logging(debug: bool, out_dir: Path, partition_id: str):
@@ -864,9 +949,27 @@ def process_band(items, band_name, date_key, tpl, bbox_proj, mask_np, tile_selec
                         out_path.unlink()
                     continue
                 
+                elapsed = time.time() - t0
+                bytes_size = os.path.getsize(out_path) if out_path.exists() else 0
                 logging.info(f"[{partition_id}]     ✓ {band_name:9s}  "
-                            f"{os.path.getsize(out_path)/1e6:.2f} MB, time {time.time()-t0:.1f}s")
+                            f"{bytes_size/1e6:.2f} MB, time {elapsed:.1f}s")
                 
+                # Emit metrics for band
+                if METRICS is not None:
+                    try:
+                        stats.update({"elapsed_s": elapsed, "bytes": bytes_size})
+                        METRICS.log(
+                            "band_end",
+                            date=date_key,
+                            band=band_name,
+                            elapsed_s=elapsed,
+                            bytes_written=bytes_size,
+                            asset_key=stats.get("asset_key"),
+                            items_before=stats.get("n_before"),
+                            items_after=stats.get("n_after"),
+                        )
+                    except Exception:
+                        pass
                 # Successfully completed
                 return True, stats
                 
@@ -1058,8 +1161,28 @@ def process_scl_assessment_and_generation(items, date_key, tpl, bbox_proj, mask_
             except Exception as e:
                 logging.warning(f"[{partition_id}]   Cannot read SCL file statistics: {e}")
             
+            elapsed = time.time() - t0
+            size_bytes = os.path.getsize(scl_out_path) if os.path.exists(scl_out_path) else 0
             logging.info(f"[{partition_id}]   ✓ SCL quality assessment and file generation complete, validity: {valid_pct:.2f}%, "
-                        f"file size: {os.path.getsize(scl_out_path)/1e6:.2f} MB, time {time.time()-t0:.1f}s")
+                        f"file size: {size_bytes/1e6:.2f} MB, time {elapsed:.1f}s")
+
+            # Emit metrics for SCL
+            if METRICS is not None:
+                try:
+                    n_before_loc = locals().get("n_before", None)
+                    n_after_loc = locals().get("n_after", None)
+                    METRICS.log(
+                        "scl_end",
+                        date=date_key,
+                        valid_pct=float(valid_pct),
+                        elapsed_s=elapsed,
+                        bytes_written=size_bytes,
+                        asset_key=locals().get("scl_asset_key"),
+                        items_before=n_before_loc,
+                        items_after=n_after_loc,
+                    )
+                except Exception:
+                    pass
             
             return True, valid_pct, tile_selection
             
@@ -1076,12 +1199,18 @@ def process_scl_assessment_and_generation(items, date_key, tpl, bbox_proj, mask_
 
 # ─── Single Day Task ──────────────────────────────────────────────────────────────────
 def process_day(date_key:str, items, tpl, bbox_proj, mask_np,
-               out_root:Path, res:int, chunksize:int,
-               overwrite:bool, min_coverage:float=5.0,
-               partition_id:str="unknown") -> bool:
+                out_root:Path, res:int, chunksize:int,
+                overwrite:bool, min_coverage:float=5.0,
+                partition_id:str="unknown") -> bool:
     """Process single day data, optimized SCL processing logic, preserving original SCL values"""
     logging.info(f"[{partition_id}] → {date_key} (item={len(items)})")
     t0 = time.time()
+    # day_start metrics
+    if METRICS is not None:
+        try:
+            METRICS.log("day_start", date=date_key, items=len(items))
+        except Exception:
+            pass
 
     try:
         # Use 60-minute timeout control for single day processing
@@ -1115,9 +1244,22 @@ def process_day(date_key:str, items, tpl, bbox_proj, mask_np,
             if not scl_success:
                 if valid_pct < min_coverage:
                     logging.warning(f"[{partition_id}]   {date_key} valid coverage {valid_pct:.2f}% < {min_coverage}%, skipping other band processing")
+                    # Metrics: day_end (skipped by coverage)
+                    if METRICS is not None:
+                        try:
+                            METRICS.log("day_end", date=date_key, success=True, skipped_for_coverage=True,
+                                        wall_s=time.time()-t0, bytes_written=0, scl_valid_pct=valid_pct)
+                        except Exception:
+                            pass
                     return True  # Insufficient coverage is not failure, just skip
                 else:
                     logging.error(f"[{partition_id}]   {date_key} SCL processing failed, skipping this date processing")
+                    if METRICS is not None:
+                        try:
+                            METRICS.log("day_end", date=date_key, success=False, scl_failed=True,
+                                        wall_s=time.time()-t0)
+                        except Exception:
+                            pass
                     return False
             
             # Create temporary directory for processing
@@ -1213,20 +1355,61 @@ def process_day(date_key:str, items, tpl, bbox_proj, mask_np,
             
             # Calculate total success: SCL success (1) + other bands success count
             total_success = (1 if scl_success else 0) + success_count
+            # Compute bytes written for this date (SCL + all bands that exist)
+            bytes_written = 0
+            try:
+                scl_path = out_root / BAND_MAPPING["SCL"] / f"{date_key}_mosaic.tiff"
+                if scl_path.exists():
+                    bytes_written += os.path.getsize(scl_path)
+            except Exception:
+                pass
+            try:
+                for band_name in [b for b in S2_BANDS if b != "SCL"]:
+                    bpath = out_root / BAND_MAPPING[band_name] / f"{date_key}_mosaic.tiff"
+                    if bpath.exists():
+                        bytes_written += os.path.getsize(bpath)
+            except Exception:
+                pass
             
             if total_success == total_bands:
                 logging.info(f"[{partition_id}] ← {date_key} all bands processed successfully ({total_success}/{total_bands}), time {proc_time:.1f}s")
+                if METRICS is not None:
+                    try:
+                        METRICS.log("day_end", date=date_key, success=True, wall_s=proc_time,
+                                    bytes_written=bytes_written, bands_success=success_count,
+                                    total_bands=total_bands, scl_valid_pct=valid_pct)
+                    except Exception:
+                        pass
                 return True
             elif total_success > 0:
                 logging.warning(f"[{partition_id}] ← {date_key} partial bands processed successfully ({total_success}/{total_bands}), time {proc_time:.1f}s")
+                if METRICS is not None:
+                    try:
+                        METRICS.log("day_end", date=date_key, success=True, partial=True, wall_s=proc_time,
+                                    bytes_written=bytes_written, bands_success=success_count,
+                                    total_bands=total_bands, scl_valid_pct=valid_pct)
+                    except Exception:
+                        pass
                 return True  # Partial success is also success
             else:
                 logging.error(f"[{partition_id}] ← {date_key} all bands processing failed, time {proc_time:.1f}s")
+                if METRICS is not None:
+                    try:
+                        METRICS.log("day_end", date=date_key, success=False, wall_s=proc_time,
+                                    bytes_written=bytes_written, bands_success=success_count,
+                                    total_bands=total_bands, scl_valid_pct=valid_pct)
+                    except Exception:
+                        pass
                 return False
                 
     except TimeoutException as e:
         proc_time = time.time() - t0
         logging.error(f"[{partition_id}] ‼️  {date_key} processing timeout ({proc_time:.1f}s): {e}")
+        if METRICS is not None:
+            try:
+                METRICS.log("day_end", date=date_key, success=False, timeout=True, wall_s=proc_time)
+            except Exception:
+                pass
         return False
     except Exception as e:
         proc_time = time.time() - t0
@@ -1234,6 +1417,11 @@ def process_day(date_key:str, items, tpl, bbox_proj, mask_np,
         if logging.getLogger().level <= logging.DEBUG:
             import traceback
             logging.debug(traceback.format_exc())
+        if METRICS is not None:
+            try:
+                METRICS.log("day_end", date=date_key, success=False, exception=type(e).__name__)
+            except Exception:
+                pass
         return False
 
 # ─── Main Program ───────────────────────────────────────────────────────────────────
@@ -1246,6 +1434,14 @@ def main():
     TEMP_DIR = a.temp_dir
 
     setup_logging(a.debug, out_dir, a.partition_id)
+    # Initialize metrics (opt-in)
+    global METRICS
+    if getattr(a, 'metrics_jsonl', None):
+        try:
+            METRICS = MetricsLogger(Path(a.metrics_jsonl), a.partition_id)
+        except Exception as e:
+            logging.warning(f"[{a.partition_id}] Failed to initialize metrics logger: {e}")
+            METRICS = None
     logging.info(f"[{a.partition_id}] ⚡ S2 Fast Processor startup (Optimized Parallel Edition - SCL Original Value Preservation Version)"); 
     log_sys(a.partition_id)
     logging.info(f"[{a.partition_id}] Processing timeout settings: Overall {PROCESS_TIMEOUT//60} minutes, Single day {DAY_TIMEOUT//60} minutes, Single band {BAND_TIMEOUT//60} minutes, SCL assessment {SCL_BAND_TIMEOUT//60} minutes")
@@ -1258,6 +1454,22 @@ def main():
         logging.info(f"[{a.partition_id}] STAC endpoint: {a.stac_endpoint} | collection: {a.stac_collection}")
 
     tpl, bbox_proj, bbox_ll, mask_np = load_roi(Path(a.input_tiff), a.partition_id)
+    if METRICS is not None:
+        try:
+            METRICS.log(
+                "run_start",
+                args=dict(
+                    start_date=a.start_date, end_date=a.end_date,
+                    stac_endpoint=("planetary_computer" if a.use_planetary_computer else a.stac_endpoint),
+                    stac_collection=a.stac_collection,
+                    dask_workers=a.dask_workers, worker_memory_gb=a.worker_memory,
+                    resolution=a.resolution, chunksize=a.chunksize,
+                    min_coverage=a.min_coverage, overwrite=bool(a.overwrite),
+                ),
+                roi=dict(width=tpl["width"], height=tpl["height"], crs=str(tpl["crs"]))
+            )
+        except Exception:
+            pass
 
     # Search STAC items
     search_date_range = f"{a.start_date}/{a.end_date}"
@@ -1272,6 +1484,11 @@ def main():
 
     # Group by date
     groups = group_by_date(items, a.partition_id)
+    if METRICS is not None:
+        try:
+            METRICS.log("run_plan", num_days=len(groups))
+        except Exception:
+            pass
 
     # Create temporary directory for processing
     base_temp_dir = tempfile.mkdtemp(prefix=f"s2_proc_{a.partition_id}_", dir=TEMP_DIR)
@@ -1359,6 +1576,14 @@ def main():
         logging.info(f"[{a.partition_id}] ✅ Partition processing complete: successful {success_count}/{total_count} days")
         logging.info(f"[{a.partition_id}] 📊 Dask performance report saved: {report_path}")
         
+        # Emit run_end metrics before exit
+        if METRICS is not None:
+            try:
+                METRICS.log("run_end", days_total=total_count, days_success=success_count)
+                METRICS.close()
+            except Exception:
+                pass
+
         # Return appropriate exit code
         if success_count == 0 and total_count > 0:
             sys.exit(1)  # All failed

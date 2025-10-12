@@ -7,6 +7,7 @@ Supports robust network handling with comprehensive retry mechanisms and timeout
 
 from __future__ import annotations
 import os, sys, argparse, logging, datetime, time, warnings, signal
+import json, threading
 from pathlib import Path
 from collections import defaultdict
 from contextlib import contextmanager
@@ -125,7 +126,88 @@ def get_args():
                    help="Maximum retries for STAC search")
     P.add_argument("--search_chunk_days", type=int, default=15,
                    help="Days per search chunk when splitting large date ranges")
+    # Metrics / instrumentation (opt-in)
+    P.add_argument("--metrics_jsonl", default=None,
+                   help="Append structured JSONL metrics to this file (opt-in)")
     return P.parse_args()
+
+# Metrics logger (opt-in, mirrors S2 implementation)
+class MetricsLogger:
+    def __init__(self, path: Path, partition_id: str):
+        self.path = Path(path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self._fh = self.path.open("a", encoding="utf-8")
+        self._lock = threading.Lock()
+        self.partition_id = partition_id
+        self.max_rss_seen = 0
+
+    def _utcnow(self):
+        return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+
+    def _proc_tree_sample(self):
+        try:
+            p0 = psutil.Process(os.getpid())
+            procs = [p0] + p0.children(recursive=True)
+        except Exception:
+            return None
+        cpu_user = 0.0; cpu_sys = 0.0; rss_sum = 0; rss_max = 0; n = 0
+        io_read = 0; io_write = 0
+        for p in procs:
+            try:
+                t = p.cpu_times()
+                cpu_user += getattr(t, 'user', 0.0)
+                cpu_sys  += getattr(t, 'system', 0.0)
+                m = p.memory_info()
+                rss_sum += getattr(m, 'rss', 0)
+                rss_max = max(rss_max, getattr(m, 'rss', 0))
+                n += 1
+                try:
+                    io = p.io_counters()
+                    io_read += getattr(io, 'read_bytes', 0)
+                    io_write += getattr(io, 'write_bytes', 0)
+                except Exception:
+                    pass
+            except Exception:
+                continue
+        self.max_rss_seen = max(self.max_rss_seen, rss_max)
+        return {
+            "cpu_user_s": cpu_user,
+            "cpu_sys_s": cpu_sys,
+            "cpu_total_s": cpu_user + cpu_sys,
+            "rss_bytes_sum": rss_sum,
+            "rss_bytes_max": rss_max,
+            "proc_count": n,
+            "io_read_bytes": io_read,
+            "io_write_bytes": io_write,
+            "max_rss_bytes_seen": self.max_rss_seen,
+        }
+
+    def log(self, event: str, **fields):
+        rec = {
+            "ts": self._utcnow(),
+            "event": event,
+            "partition_id": self.partition_id,
+            "pid": os.getpid(),
+        }
+        rec.update(fields)
+        if event in {"run_start", "run_end", "day_start", "day_end"}:
+            rec["proc"] = self._proc_tree_sample()
+        line = json.dumps(rec, ensure_ascii=False)
+        with self._lock:
+            self._fh.write(line + "\n")
+            self._fh.flush()
+
+    def close(self):
+        try:
+            with self._lock:
+                self._fh.close()
+        except Exception:
+            pass
+
+METRICS = None  # global handle when enabled
 
 # Logging
 def setup_logging(debug: bool, out_dir: Path, partition_id: str):
@@ -845,6 +927,13 @@ def process_day_orbit(key, items, tpl, bbox_proj, mask_np, out_dir, resolution, 
     date_str, orbit_state = key.split("_")
     logging.info(f"[{partition_id}] → {key} (item={len(items)})")
     t0 = time.time()
+    # metrics: day_start
+    try:
+        if METRICS is not None:
+            date_str_tmp, orbit_tmp = key.split("_")
+            METRICS.log("day_start", key=key, date=date_str_tmp, orbit=orbit_tmp, items=len(items))
+    except Exception:
+        pass
     
     try:
         # Use timeout control for single day processing
@@ -957,17 +1046,61 @@ def process_day_orbit(key, items, tpl, bbox_proj, mask_np, out_dir, resolution, 
                 
                 # Output processing results
                 total_duration = time.time() - t0
+                # Compute bytes written
+                bytes_written = 0
+                try:
+                    if vv_out.exists():
+                        bytes_written += os.path.getsize(vv_out)
+                except Exception:
+                    pass
+                try:
+                    if vh_out.exists():
+                        bytes_written += os.path.getsize(vh_out)
+                except Exception:
+                    pass
                 if vv_success and vh_success:
                     logging.info(f"[{partition_id}] ← {key} successfully processed VV and VH, took {total_duration:.1f}s")
+                    if METRICS is not None:
+                        try:
+                            METRICS.log("day_end", key=key, date=date_str, orbit=orbit_state, success=True,
+                                        vv=True, vh=True, wall_s=total_duration, bytes_written=bytes_written,
+                                        items_processed=processed_count, items_failed=failed_count,
+                                        items_skipped=skipped_count, items_no_data=no_data_count)
+                        except Exception:
+                            pass
                     return True
                 elif vv_success:
                     logging.info(f"[{partition_id}] ← {key} only successfully processed VV, took {total_duration:.1f}s")
+                    if METRICS is not None:
+                        try:
+                            METRICS.log("day_end", key=key, date=date_str, orbit=orbit_state, success=True,
+                                        vv=True, vh=False, wall_s=total_duration, bytes_written=bytes_written,
+                                        items_processed=processed_count, items_failed=failed_count,
+                                        items_skipped=skipped_count, items_no_data=no_data_count)
+                        except Exception:
+                            pass
                     return True
                 elif vh_success:
                     logging.info(f"[{partition_id}] ← {key} only successfully processed VH, took {total_duration:.1f}s")
+                    if METRICS is not None:
+                        try:
+                            METRICS.log("day_end", key=key, date=date_str, orbit=orbit_state, success=True,
+                                        vv=False, vh=True, wall_s=total_duration, bytes_written=bytes_written,
+                                        items_processed=processed_count, items_failed=failed_count,
+                                        items_skipped=skipped_count, items_no_data=no_data_count)
+                        except Exception:
+                            pass
                     return True
                 else:
                     logging.error(f"[{partition_id}] ← {key} processing failed, took {total_duration:.1f}s")
+                    if METRICS is not None:
+                        try:
+                            METRICS.log("day_end", key=key, date=date_str, orbit=orbit_state, success=False,
+                                        wall_s=total_duration, bytes_written=bytes_written,
+                                        items_processed=processed_count, items_failed=failed_count,
+                                        items_skipped=skipped_count, items_no_data=no_data_count)
+                        except Exception:
+                            pass
                     return False
                     
             finally:
@@ -981,10 +1114,24 @@ def process_day_orbit(key, items, tpl, bbox_proj, mask_np, out_dir, resolution, 
     except TimeoutException as e:
         total_duration = time.time() - t0
         logging.error(f"[{partition_id}] ‼️  {key} processing timeout ({total_duration:.1f}s > {DAY_TIMEOUT}s): {e}")
+        try:
+            if METRICS is not None:
+                date_str_tmp, orbit_tmp = key.split("_")
+                METRICS.log("day_end", key=key, date=date_str_tmp, orbit=orbit_tmp, success=False, timeout=True,
+                            wall_s=total_duration)
+        except Exception:
+            pass
         return False
     except Exception as e:
         total_duration = time.time() - t0
         logging.error(f"[{partition_id}] ✗ Error processing {key} (took {total_duration:.1f}s): {type(e).__name__} - {e}")
+        try:
+            if METRICS is not None:
+                date_str_tmp, orbit_tmp = key.split("_")
+                METRICS.log("day_end", key=key, date=date_str_tmp, orbit=orbit_tmp, success=False,
+                            exception=type(e).__name__, wall_s=total_duration)
+        except Exception:
+            pass
         return False
 
 # Main program
@@ -995,6 +1142,14 @@ def main():
     no_data_days = 0
 
     setup_logging(args.debug, out_dir, args.partition_id)
+    # Initialize metrics (opt-in)
+    global METRICS
+    if getattr(args, 'metrics_jsonl', None):
+        try:
+            METRICS = MetricsLogger(Path(args.metrics_jsonl), args.partition_id)
+        except Exception as e:
+            logging.warning(f"[{args.partition_id}] Failed to initialize metrics logger: {e}")
+            METRICS = None
     logging.info(f"[{args.partition_id}] ⚡ S1 Fast Processor starting (Robust Network Edition)"); 
     log_sys(args.partition_id)
     logging.info(f"[{args.partition_id}] Network settings: search retries {args.max_search_retries}, chunk size {args.search_chunk_days} days")
@@ -1002,6 +1157,22 @@ def main():
     logging.info(f"[{args.partition_id}] Processing time period: {args.start_date} → {args.end_date}")
 
     tpl, bbox_proj, bbox_ll, mask_np = load_roi(Path(args.input_tiff), args.partition_id)
+    # Emit run_start metrics
+    if METRICS is not None:
+        try:
+            METRICS.log(
+                "run_start",
+                args=dict(
+                    start_date=args.start_date, end_date=args.end_date,
+                    orbit_state=args.orbit_state, dask_workers=args.dask_workers,
+                    worker_memory_gb=args.worker_memory, resolution=args.resolution,
+                    chunksize=args.chunksize, min_coverage=args.min_coverage,
+                    overwrite=bool(args.overwrite)
+                ),
+                roi=dict(width=tpl["width"], height=tpl["height"], crs=str(tpl["crs"]))
+            )
+        except Exception:
+            pass
     
     # Search items based on orbit state with robust retry
     if args.orbit_state == "both":
@@ -1023,6 +1194,11 @@ def main():
 
     # Group by date and orbit state
     groups = group_by_date_orbit(items, args.partition_id)
+    if METRICS is not None:
+        try:
+            METRICS.log("run_plan", num_groups=len(groups))
+        except Exception:
+            pass
 
     with make_client(args.dask_workers, args.worker_memory, args.partition_id):
         report_path = out_dir / f"dask-report-{args.partition_id}.html"
@@ -1055,6 +1231,13 @@ def main():
     
     logging.info(f"[{args.partition_id}] ✅ Partition processing complete: success {success_count}/{total_count} days")
     logging.info(f"[{args.partition_id}] 📊 Dask performance report saved: {report_path}")
+    # Emit run_end metrics
+    if METRICS is not None:
+        try:
+            METRICS.log("run_end", groups_total=total_count, groups_success=success_count)
+            METRICS.close()
+        except Exception:
+            pass
     
     # Return appropriate exit code
     if success_count == 0:

@@ -29,6 +29,7 @@
   - [Hardware Requirements](#hardware-requirements)
   - [Data Preprocessing](#data-preprocessing)
   - [Inference](#inference)
+  - [Metrics & Benchmarking](#metrics--benchmarking)
   - [Downstream Tasks](#downstream-tasks)
   - [Citation](#citation)
   - [Acknowledgments](#acknowledgments)
@@ -237,6 +238,37 @@ Each subfolder should contain the following files:
 ```
 
 If these files exist, you can start inference. Otherwise, check if the first step completed successfully.
+
+## Metrics & Benchmarking
+
+This repository includes low‑overhead, opt‑in metrics for CPU preprocessing so you can estimate wall time, CPU hours, memory headroom, and throughput before refactoring.
+
+- General tips
+  - Use a fast local/NVMe temp directory to reduce I/O stalls: `export TEMP_DIR=/fast/tmp`.
+  - The processors save a Dask performance report next to the output as `dask-report-<partition_id>.html`.
+  - You can also wrap the entire command with your system `/usr/bin/time -p` (or GNU time) to capture whole‑process timing.
+
+### Sentinel‑2 (S2) CPU metrics
+
+- Enable metrics JSONL when running preprocessing:
+  - `python tessera_preprocessing/s2_fast_processor.py --input_tiff /path/roi.tif --start_date 2020-01-01 --end_date 2020-12-31 --output /data/s2_out --stac_endpoint https://earth-search.aws.element84.com/v1 --stac_collection sentinel-2-l2a --dask_workers 8 --worker_memory 16 --metrics_jsonl /data/s2_out/metrics/s2_metrics.jsonl`
+- Optional whole‑process timing (CPU hours, max RSS) using system time:
+  - `/usr/bin/time -p sh -c 'python tessera_preprocessing/s2_fast_processor.py ...same args...'`
+- Summarize S2 run:
+  - `python tessera_preprocessing/tools/summarize_metrics.py --metrics /data/s2_out/metrics/s2_metrics.jsonl`
+- Summary includes:
+  - CPU hours (sum over process tree), max RSS, days processed, useful write rate (MiB/s), total bytes written (GiB), and SCL valid% (mean/median/p10/p90).
+
+### Sentinel‑1 (S1) CPU metrics
+
+- Enable metrics JSONL when running preprocessing:
+  - `python tessera_preprocessing/s1_fast_processor.py --input_tiff /path/roi.tif --start_date 2020-01-01 --end_date 2020-12-31 --output /data/s1_out --orbit_state both --dask_workers 8 --worker_memory 16 --workers 8 --metrics_jsonl /data/s1_out/metrics/s1_metrics.jsonl`
+- Optional whole‑process timing (CPU hours, max RSS) using system time:
+  - `/usr/bin/time -p sh -c 'python tessera_preprocessing/s1_fast_processor.py ...same args...'`
+- Summarize S1 run:
+  - `python tessera_preprocessing/tools/summarize_s1_metrics.py --metrics /data/s1_out/metrics/s1_metrics.jsonl`
+- Summary includes:
+  - CPU hours (proc‑tree), max RSS, processed groups (date+orbit), useful write rate, total bytes written (GiB), outcome counts (both VV/VH, VV‑only, VH‑only, failed), and per‑item tallies (processed/skipped/no_data/failed).
 
 Inference requires PyTorch. Since each system may have slightly different CUDA versions, we can't provide a Docker-encapsulated Python environment like we did for data preprocessing. Fortunately, the Python environment for inference is much simpler to configure than for data preprocessing, as it doesn't use geographic processing packages like GDAL or SNAP.
 
