@@ -252,6 +252,7 @@ This repository includes low‑overhead, opt‑in metrics for CPU preprocessing 
 
 - Enable metrics JSONL when running preprocessing:
   - `python tessera_preprocessing/s2_fast_processor.py --input_tiff /path/roi.tif --start_date 2020-01-01 --end_date 2020-12-31 --output /data/s2_out --stac_endpoint https://earth-search.aws.element84.com/v1 --stac_collection sentinel-2-l2a --dask_workers 8 --worker_memory 16 --metrics_jsonl /data/s2_out/metrics/s2_metrics.jsonl`
+  - Optional tunables (new): `--threads_per_worker 2|4`, `--mem_guard_frac 0.6`, `--mem_guard_cap_gb 32`, and Dask spilling knobs `--dask_mem_target 0.6 --dask_mem_spill 0.75 --dask_mem_pause 0.9 --dask_mem_terminate 0.99`.
 - Optional whole‑process timing (CPU hours, max RSS) using system time:
   - `/usr/bin/time -p sh -c 'python tessera_preprocessing/s2_fast_processor.py ...same args...'`
 - Summarize S2 run:
@@ -263,6 +264,7 @@ This repository includes low‑overhead, opt‑in metrics for CPU preprocessing 
 
 - Enable metrics JSONL when running preprocessing:
   - `python tessera_preprocessing/s1_fast_processor.py --input_tiff /path/roi.tif --start_date 2020-01-01 --end_date 2020-12-31 --output /data/s1_out --orbit_state both --dask_workers 8 --worker_memory 16 --workers 8 --metrics_jsonl /data/s1_out/metrics/s1_metrics.jsonl`
+  - Optional tunables (new): `--threads_per_worker 2|4` and optional Dask spilling knobs `--dask_mem_target ... --dask_mem_spill ... --dask_mem_pause ... --dask_mem_terminate ...`.
 - Optional whole‑process timing (CPU hours, max RSS) using system time:
   - `/usr/bin/time -p sh -c 'python tessera_preprocessing/s1_fast_processor.py ...same args...'`
 - Summarize S1 run:
@@ -438,6 +440,44 @@ npy_path = "/maps/usr/tessera_project/my_data/stitched_representation.npy"  # Ch
 ref_tiff_path = "/maps/usr/tessera_project/my_data/roi.tiff"  # Change to the actual reference tiff file path
 out_dir = "/maps/usr/tessera_project/my_data/"  # Change to the actual output directory
 ```
+
+## Quick ROI + AWS Smoke Test
+
+Create a per‑tile ROI once and run a short, low‑cost Sentinel‑2 CPU test on AWS.
+
+1) Install utility‑only dependencies (separate from pipeline requirements):
+
+```bash
+pip install geopandas pyogrio shapely rasterio fiona numpy pyarrow requests
+# or with uv
+uv pip install -q geopandas pyogrio shapely rasterio fiona numpy pyarrow requests
+```
+
+2) Create a 10 m ROI TIFF for MGRS tile 31TCH:
+
+```bash
+python util/fetch_s2_tile_and_make_roi.py --tile 31TCH --make_roi_tiff
+```
+
+What you should see
+
+- <repo_root>/data/grids/31TCH.geojson
+- <repo_root>/data/grids/31TCH.gpkg
+- <repo_root>/data/grids/31TCH_roi_10m.tiff
+
+3) Upload the ROI once to your bucket (example uses tessera-test1):
+
+```bash
+aws s3 cp <repo_root>/data/grids/31TCH_roi_10m.tiff s3://tessera-test1/rois/31TCH_roi_10m.tiff
+```
+
+4) Launch the 3‑day smoke test on EC2
+
+- Use the user‑data in `docs/aws_s2_run_and_publish.md` and set:
+  - `S3_BUCKET_PREFIX="s3://tessera-test1/tessera/s2"`
+  - `ROI_TIFF_S3="s3://tessera-test1/rois/31TCH_roi_10m.tiff"`
+
+Recommended instance for the smoke test: `m7i.xlarge` (4 vCPU, 16 GB RAM) with ~150 GB gp3 and an instance role that allows `s3:PutObject` and `s3:ListBucket` to your bucket.
 
 ## Downstream tasks
 

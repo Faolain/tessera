@@ -43,9 +43,9 @@ set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 # ==== CONFIGURE THESE ====
-export S3_BUCKET_PREFIX="s3://YOUR_BUCKET/tessera/s2"   # where logs/metrics go
+export S3_BUCKET_PREFIX="s3://tessera-test1/tessera/s2"   # where logs/metrics go
 export PARTITION_ID="31TCH_2024Q2"                      # label for this run
-export ROI_TIFF_S3="s3://YOUR_BUCKET/rois/31TCH.tiff"  # ROI template (10 m) in S3
+export ROI_TIFF_S3="s3://tessera-test1/rois/31TCH.tiff"  # ROI template (10 m) in S3
 export START_DATE="2024-04-01"
 export END_DATE="2024-06-30"
 export DASK_WORKERS=4

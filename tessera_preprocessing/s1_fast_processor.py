@@ -114,6 +114,17 @@ def get_args():
     P.add_argument("--dask_workers", type=int,   default=8)
     P.add_argument("--worker_memory",type=int,   default=16)
     P.add_argument("--chunksize",    type=int,   default=1024)
+    # Tunables: worker threads and optional Dask memory thresholds
+    P.add_argument("--threads_per_worker", type=int, default=4,
+                   help="Dask threads per worker (default 4)")
+    P.add_argument("--dask_mem_target", type=float, default=None,
+                   help="Optional: distributed.worker.memory.target fraction (unset: do not override env)")
+    P.add_argument("--dask_mem_spill", type=float, default=None,
+                   help="Optional: distributed.worker.memory.spill fraction (unset: do not override env)")
+    P.add_argument("--dask_mem_pause", type=float, default=None,
+                   help="Optional: distributed.worker.memory.pause fraction (unset: do not override env)")
+    P.add_argument("--dask_mem_terminate", type=float, default=None,
+                   help="Optional: distributed.worker.memory.terminate fraction (unset: do not override env)")
     P.add_argument("--resolution",   type=float, default=10.0)
     P.add_argument("--workers",      type=int,   default=8)
     P.add_argument("--overwrite",    action="store_true")
@@ -249,7 +260,12 @@ def fmt_bbox(b):
     return f"{b[0]:.5f},{b[1]:.5f} ⇢ {b[2]:.5f},{b[3]:.5f}"
 
 # Dask
-def make_client(req_workers:int, req_mem:int, partition_id: str):
+def make_client(req_workers:int, req_mem:int, partition_id: str,
+                threads_per_worker:int=4,
+                dask_mem_target:float|None=None,
+                dask_mem_spill:float|None=None,
+                dask_mem_pause:float|None=None,
+                dask_mem_terminate:float|None=None):
     """Create Dask client with partition-specific dashboard port"""
     total_mem = psutil.virtual_memory().total / 1e9
     workers = min(req_workers, os.cpu_count(),
@@ -266,17 +282,24 @@ def make_client(req_workers:int, req_mem:int, partition_id: str):
     
     cluster = LocalCluster(
         n_workers         = workers,
-        threads_per_worker= 4,
+        threads_per_worker= threads_per_worker,
         processes         = True,
         memory_limit      = f"{req_mem}GB",
         dashboard_address = f":{dashboard_port}",
         silence_logs      = "ERROR",
     )
-    dask.config.set({
-        "distributed.worker.memory.target": 0.80,
-        "distributed.worker.memory.spill":  0.90,
-        "distributed.worker.memory.pause":  0.95,
-    })
+    # Only set Dask memory spill thresholds if provided; otherwise respect env/defaults
+    dcfg = {}
+    if dask_mem_target is not None:
+        dcfg["distributed.worker.memory.target"] = max(0.0, min(1.0, dask_mem_target))
+    if dask_mem_spill is not None:
+        dcfg["distributed.worker.memory.spill"] = max(0.0, min(1.0, dask_mem_spill))
+    if dask_mem_pause is not None:
+        dcfg["distributed.worker.memory.pause"] = max(0.0, min(1.0, dask_mem_pause))
+    if dask_mem_terminate is not None:
+        dcfg["distributed.worker.memory.terminate"] = max(0.0, min(1.0, dask_mem_terminate))
+    if dcfg:
+        dask.config.set(dcfg)
     cli = Client(cluster, asynchronous=False)
     logging.info(f"[{partition_id}] Dask dashboard → {cli.dashboard_link}")
     return cli
@@ -1165,8 +1188,10 @@ def main():
                 args=dict(
                     start_date=args.start_date, end_date=args.end_date,
                     orbit_state=args.orbit_state, dask_workers=args.dask_workers,
-                    worker_memory_gb=args.worker_memory, resolution=args.resolution,
-                    chunksize=args.chunksize, min_coverage=args.min_coverage,
+                    worker_memory_gb=args.worker_memory, threads_per_worker=args.threads_per_worker,
+                    resolution=args.resolution, chunksize=args.chunksize, min_coverage=args.min_coverage,
+                    dask_mem_target=args.dask_mem_target, dask_mem_spill=args.dask_mem_spill,
+                    dask_mem_pause=args.dask_mem_pause, dask_mem_terminate=args.dask_mem_terminate,
                     overwrite=bool(args.overwrite)
                 ),
                 roi=dict(width=tpl["width"], height=tpl["height"], crs=str(tpl["crs"]))
@@ -1200,7 +1225,12 @@ def main():
         except Exception:
             pass
 
-    with make_client(args.dask_workers, args.worker_memory, args.partition_id):
+    with make_client(args.dask_workers, args.worker_memory, args.partition_id,
+                     threads_per_worker=args.threads_per_worker,
+                     dask_mem_target=args.dask_mem_target,
+                     dask_mem_spill=args.dask_mem_spill,
+                     dask_mem_pause=args.dask_mem_pause,
+                     dask_mem_terminate=args.dask_mem_terminate):
         report_path = out_dir / f"dask-report-{args.partition_id}.html"
         with performance_report(filename=report_path):
             # Create thread pool to process multiple dates

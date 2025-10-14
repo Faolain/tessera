@@ -79,6 +79,10 @@ SCL_DESCRIPTIONS = {
     11: "Snow"
 }
 
+# Memory guard defaults (tunable via CLI)
+MEM_GUARD_FRAC: float = 0.5
+MEM_GUARD_CAP_GB: float = 32.0
+
 # Helper: map logical band name (e.g., "B02" or "SCL") to the actual
 # STAC asset key present in the items. This allows us to work with both
 # Microsoft Planetary Computer (B02/B03/.../SCL) and AWS Earth Search
@@ -182,6 +186,22 @@ def get_args():
     P.add_argument("--dask_workers", type=int,   default=8, help="Number of Dask workers for this partition")
     P.add_argument("--worker_memory",type=int,   default=16, help="Memory per worker in GB")
     P.add_argument("--chunksize",    type=int,   default=1024, help="stackstac x/y chunk size")
+    # Tunables: worker threads and memory guard
+    P.add_argument("--threads_per_worker", type=int, default=4,
+                   help="Dask threads per worker (default 4)")
+    P.add_argument("--mem_guard_frac", type=float, default=0.5,
+                   help="Fraction of current available RAM a single array is allowed to consume (default 0.5)")
+    P.add_argument("--mem_guard_cap_gb", type=float, default=32,
+                   help="Absolute GB cap for the memory guard threshold (default 32)")
+    # Optional Dask memory thresholds (only applied if provided)
+    P.add_argument("--dask_mem_target", type=float, default=None,
+                   help="Optional: distributed.worker.memory.target fraction (unset: do not override env)")
+    P.add_argument("--dask_mem_spill", type=float, default=None,
+                   help="Optional: distributed.worker.memory.spill fraction (unset: do not override env)")
+    P.add_argument("--dask_mem_pause", type=float, default=None,
+                   help="Optional: distributed.worker.memory.pause fraction (unset: do not override env)")
+    P.add_argument("--dask_mem_terminate", type=float, default=None,
+                   help="Optional: distributed.worker.memory.terminate fraction (unset: do not override env)")
     P.add_argument("--resolution",   type=float,   default=10.0, help="Output resolution (meters)")
     P.add_argument("--overwrite",    action="store_true", help="Overwrite existing files")
     P.add_argument("--debug",        action="store_true", help="Output debug logs")
@@ -324,7 +344,12 @@ def fmt_bbox(b):
     return f"{b[0]:.5f},{b[1]:.5f} ⇢ {b[2]:.5f},{b[3]:.5f}"
 
 # ─── Dask ─────────────────────────────────────────────────────────────────────
-def make_client(req_workers:int, req_mem:int, partition_id: str):
+def make_client(req_workers:int, req_mem:int, partition_id: str,
+                threads_per_worker:int=4,
+                dask_mem_target:float|None=None,
+                dask_mem_spill:float|None=None,
+                dask_mem_pause:float|None=None,
+                dask_mem_terminate:float|None=None):
     """Create Dask client with partition-specific dashboard port"""
     total_mem = psutil.virtual_memory().total / 1e9
     workers = min(req_workers, os.cpu_count(),
@@ -339,21 +364,26 @@ def make_client(req_workers:int, req_mem:int, partition_id: str):
     port_range = 120
     dashboard_port = port_base + (hash(partition_id) % port_range)
     
-    # Configure Dask performance optimization options
+    # Configure Dask performance options; only set spill thresholds if provided (let env/defaults win otherwise)
     dask_config = {
-        "distributed.worker.memory.target": 0.75,  # Lower to reduce memory pressure
-        "distributed.worker.memory.spill": 0.85,   # Lower to reduce memory pressure
-        "distributed.worker.memory.pause": 0.95,
-        "array.slicing.split_large_chunks": True,  # Optimize large array slicing
-        "optimization.fuse.active": True,         # Activate fusion optimization
-        "optimization.fuse.ave-width": 4          # Accelerate dask graph optimization
+        "array.slicing.split_large_chunks": True,
+        "optimization.fuse.active": True,
+        "optimization.fuse.ave-width": 4,
     }
-    
-    dask.config.set(dask_config)
+    if dask_mem_target is not None:
+        dask_config["distributed.worker.memory.target"] = max(0.0, min(1.0, dask_mem_target))
+    if dask_mem_spill is not None:
+        dask_config["distributed.worker.memory.spill"] = max(0.0, min(1.0, dask_mem_spill))
+    if dask_mem_pause is not None:
+        dask_config["distributed.worker.memory.pause"] = max(0.0, min(1.0, dask_mem_pause))
+    if dask_mem_terminate is not None:
+        dask_config["distributed.worker.memory.terminate"] = max(0.0, min(1.0, dask_mem_terminate))
+    if dask_config:
+        dask.config.set(dask_config)
     
     cluster = LocalCluster(
         n_workers         = workers,
-        threads_per_worker= 4,
+        threads_per_worker= threads_per_worker,
         processes         = True,
         memory_limit      = f"{req_mem}GB",
         dashboard_address = f":{dashboard_port}",
@@ -492,11 +522,14 @@ def check_memory_requirements(shape, dtype=np.uint16):
         # Get current available memory
         available_gb = psutil.virtual_memory().available / (1024**3)
         
-        # Use 50% of current available memory as threshold
-        threshold_gb = min(available_gb * 0.5, 32)  # Not exceeding 32GB
+        # Threshold: fraction of current available memory, capped
+        threshold_gb = min(available_gb * float(MEM_GUARD_FRAC), float(MEM_GUARD_CAP_GB))
         
         if memory_gb > threshold_gb:
-            logging.warning(f"⚠️  Memory requirement {memory_gb:.2f}GB exceeds available threshold {threshold_gb:.2f}GB, skipping processing")
+            logging.warning(
+                f"⚠️  Memory requirement {memory_gb:.2f}GB exceeds threshold {threshold_gb:.2f}GB "
+                f"(avail {available_gb:.2f}GB, frac {MEM_GUARD_FRAC:.2f}, cap {MEM_GUARD_CAP_GB:.0f}GB), skipping"
+            )
             return False
         return True
     except (OverflowError, ValueError) as e:
@@ -1463,7 +1496,11 @@ def main():
                     stac_endpoint=("planetary_computer" if a.use_planetary_computer else a.stac_endpoint),
                     stac_collection=a.stac_collection,
                     dask_workers=a.dask_workers, worker_memory_gb=a.worker_memory,
+                    threads_per_worker=a.threads_per_worker,
                     resolution=a.resolution, chunksize=a.chunksize,
+                    mem_guard_frac=a.mem_guard_frac, mem_guard_cap_gb=a.mem_guard_cap_gb,
+                    dask_mem_target=a.dask_mem_target, dask_mem_spill=a.dask_mem_spill,
+                    dask_mem_pause=a.dask_mem_pause, dask_mem_terminate=a.dask_mem_terminate,
                     min_coverage=a.min_coverage, overwrite=bool(a.overwrite),
                 ),
                 roi=dict(width=tpl["width"], height=tpl["height"], crs=str(tpl["crs"]))
@@ -1495,8 +1532,20 @@ def main():
     logging.info(f"[{a.partition_id}] Main temporary directory: {base_temp_dir}")
 
     try:
+        # Apply CLI tunables
+        global MEM_GUARD_FRAC, MEM_GUARD_CAP_GB
+        MEM_GUARD_FRAC = float(a.mem_guard_frac)
+        MEM_GUARD_CAP_GB = float(a.mem_guard_cap_gb)
+
         # Create initial client
-        dask_client = make_client(a.dask_workers, a.worker_memory, a.partition_id)
+        dask_client = make_client(
+            a.dask_workers, a.worker_memory, a.partition_id,
+            threads_per_worker=a.threads_per_worker,
+            dask_mem_target=a.dask_mem_target,
+            dask_mem_spill=a.dask_mem_spill,
+            dask_mem_pause=a.dask_mem_pause,
+            dask_mem_terminate=a.dask_mem_terminate,
+        )
         
         report_path = out_dir / f"dask-report-{a.partition_id}.html"
         with performance_report(filename=report_path):
@@ -1528,7 +1577,14 @@ def main():
                             time.sleep(5)
                             
                             # Recreate client
-                            dask_client = make_client(a.dask_workers, a.worker_memory, a.partition_id)
+                            dask_client = make_client(
+                                a.dask_workers, a.worker_memory, a.partition_id,
+                                threads_per_worker=a.threads_per_worker,
+                                dask_mem_target=a.dask_mem_target,
+                                dask_mem_spill=a.dask_mem_spill,
+                                dask_mem_pause=a.dask_mem_pause,
+                                dask_mem_terminate=a.dask_mem_terminate,
+                            )
                             logging.info(f"[{a.partition_id}] Dask client recreated successfully")
                         except Exception as recreate_error:
                             logging.error(f"[{a.partition_id}] Cannot recreate Dask client: {recreate_error}")
@@ -1557,7 +1613,14 @@ def main():
                         
                         # Recreate client
                         time.sleep(5)  # Wait for resource release
-                        dask_client = make_client(a.dask_workers, a.worker_memory, a.partition_id)
+                        dask_client = make_client(
+                            a.dask_workers, a.worker_memory, a.partition_id,
+                            threads_per_worker=a.threads_per_worker,
+                            dask_mem_target=a.dask_mem_target,
+                            dask_mem_spill=a.dask_mem_spill,
+                            dask_mem_pause=a.dask_mem_pause,
+                            dask_mem_terminate=a.dask_mem_terminate,
+                        )
                         logging.info(f"[{a.partition_id}] Dask client recreated successfully after exception")
                     except:
                         # If unable to recreate client, continue trying to process next day
