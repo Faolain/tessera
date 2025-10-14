@@ -479,6 +479,77 @@ aws s3 cp <repo_root>/data/grids/31TCH_roi_10m.tiff s3://tessera-test1/rois/31TC
 
 Recommended instance for the smoke test: `m7i.xlarge` (4 vCPU, 16 GB RAM) with ~150 GB gp3 and an instance role that allows `s3:PutObject` and `s3:ListBucket` to your bucket.
 
+### S2 smoke test: stack to NPYs and publish (local or EC2)
+
+Once your CPU mosaics write successfully, stack to NPYs and (optionally) publish logs/metrics and NPYs to S3. You can run the individual commands or the one‑shot wrapper.
+
+- Individual commands (useful for debugging):
+
+```bash
+# 0) (Optional) If a band was skipped (e.g., B04/red), rerun with smaller chunks
+python tessera_preprocessing/s2_fast_processor.py \
+  --input_tiff /data/grids/roi.tiff \
+  --start_date 2024-04-15 --end_date 2024-04-17 \
+  --output /data/s2_out_smoke \
+  --dask_workers 1 --worker_memory 16 --threads_per_worker 4 \
+  --chunksize 256 --mem_guard_frac 0.9 --min_coverage 0 \
+  --partition_id 31TCH_2024_SMOKE
+
+# 1) Stack per‑band TIFFs → NPYs
+./tessera_preprocessing/s2_stack \
+  --input /data/s2_out_smoke \
+  --output /data/s2_npys_smoke \
+  --batch-size 8 --cache-level 1 --num-threads 8 --sample-rate 1
+
+# 2) Validate shapes
+python - << 'PY'
+import os, numpy as np
+root='/data/s2_npys_smoke'
+for f in ('bands.npy','masks.npy','doys.npy'):
+    p=os.path.join(root,f); a=np.load(p, mmap_mode='r'); print(f, a.shape, a.dtype)
+PY
+
+# 3) Summarize CPU metrics
+python tessera_preprocessing/tools/summarize_metrics.py --metrics /data/s2_out_smoke/metrics/s2_metrics.jsonl
+
+# 4) Publish logs/metrics (optional)
+bash tessera_preprocessing/tools/publish_to_s3.sh \
+  --local-root /data/s2_out_smoke \
+  --partition-id 31TCH_2024_SMOKE \
+  --s3 s3://tessera-test1/tessera/s2 \
+  --upload-outputs 0
+
+# 5) Publish NPYs (optional)
+aws s3 sync /data/s2_npys_smoke s3://tessera-test1/tessera/s2_npys/31TCH_2024_SMOKE/$(date -u +%Y%m%dT%H%M%SZ)/ --only-show-errors --no-progress
+```
+
+- One‑shot wrapper (recommended after you confirm the ROI and dates):
+
+```bash
+bash tessera_preprocessing/tools/run_s2_smoke_e2e.sh \
+  --roi_tiff /data/grids/31TCH_roi_10m.tiff \
+  --start 2024-04-15 --end 2024-04-17 \
+  --local-root /data/s2_out_smoke \
+  --npys-out /data/s2_npys_smoke \
+  --partition 31TCH_2024_SMOKE \
+  --s3 s3://tessera-test1/tessera/s2 \
+  --s3-npys s3://tessera-test1/tessera/s2_npys \
+  --dask-workers 1 --worker-mem 16 --threads 4 --chunksize 256 --mem-guard-frac 0.9
+```
+
+Tuning for more days
+- Increase `--end` range and (optionally) `--dask-workers` when memory allows.
+- If you see a band skipped by the memory guard, reduce `--chunksize` (e.g., 512→256) or increase instance RAM.
+- Keep BLAS threads at 1 to avoid oversubscription: `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1` (wrapper sets these).
+
+End‑to‑end metrics (optional, included in wrapper)
+
+- The wrapper now records step metrics for both phases to `e2e.jsonl` under `--local-root/metrics/` via `tessera_preprocessing/tools/measure_subprocess.py`. It tracks per‑step wall time, approximate proc‑tree CPU seconds, max RSS across the process tree, and bytes written under the tracked output directories.
+- Validate the stacked NPYs and capture their shapes with `tessera_preprocessing/tools/validate_s2_npys.py`. The wrapper appends a `npy_validate` event to `e2e.jsonl` and prints a one‑line summary.
+- To summarize end‑to‑end, use:
+  - `python tessera_preprocessing/tools/summarize_e2e.py --e2e /data/s2_out_smoke/metrics/e2e.jsonl`
+- The S3 publisher (`tools/publish_to_s3.sh`) uploads `e2e.jsonl` and `summary_e2e.txt` alongside existing logs/metrics.
+
 ## Downstream tasks
 
 If you want to reproduce the downstream tasks in the paper, you can visit https://github.com/ucam-eo/tessera-downstream-task. There are many examples provided there.

@@ -59,14 +59,19 @@ mkdir -p "${EXPORT_DIR}" || true
 LOG_FILE="${LOCAL_ROOT}/s2_${PARTITION_ID}_detail.log"
 DASK_REPORT="$(ls -1 ${LOCAL_ROOT}/dask-report-${PARTITION_ID}.html 2>/dev/null || true)"
 METRICS="${LOCAL_ROOT}/metrics/s2_metrics.jsonl"
+E2E_METRICS="${LOCAL_ROOT}/metrics/e2e.jsonl"
 
 [[ -f "${LOG_FILE}" ]] && cp -f "${LOG_FILE}" "${EXPORT_DIR}/"
 [[ -f "${METRICS}" ]] && cp -f "${METRICS}" "${EXPORT_DIR}/"
+[[ -f "${E2E_METRICS}" ]] && cp -f "${E2E_METRICS}" "${EXPORT_DIR}/"
 [[ -f "${DASK_REPORT}" ]] && cp -f "${DASK_REPORT}" "${EXPORT_DIR}/"
 
 # Optional human-readable summary
 if [[ -f "tessera_preprocessing/tools/summarize_metrics.py" && -f "${METRICS}" ]]; then
   python tessera_preprocessing/tools/summarize_metrics.py --metrics "${METRICS}" > "${EXPORT_DIR}/summary.txt" || true
+fi
+if [[ -f "tessera_preprocessing/tools/summarize_e2e.py" && -f "${E2E_METRICS}" ]]; then
+  python tessera_preprocessing/tools/summarize_e2e.py --e2e "${E2E_METRICS}" > "${EXPORT_DIR}/summary_e2e.txt" || true
 fi
 
 # Manifest
@@ -102,4 +107,3 @@ if [[ "${DELETE_LOCAL}" == "1" ]]; then
 fi
 
 echo "Published to ${BASE_S3}"
-
