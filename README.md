@@ -534,7 +534,8 @@ bash tessera_preprocessing/tools/run_s2_smoke_e2e.sh \
   --partition 31TCH_2024_SMOKE \
   --s3 s3://tessera-test1/tessera/s2 \
   --s3-npys s3://tessera-test1/tessera/s2_npys \
-  --dask-workers 1 --worker-mem 16 --threads 4 --chunksize 256 --mem-guard-frac 0.9
+  --dask-workers 1 --worker-mem 16 --threads 4 --chunksize 256 --mem-guard-frac 0.9 \
+  [--cleanup-mosaics 0|1]
 ```
 
 Tuning for more days
@@ -549,6 +550,23 @@ End‑to‑end metrics (optional, included in wrapper)
 - To summarize end‑to‑end, use:
   - `python tessera_preprocessing/tools/summarize_e2e.py --e2e /data/s2_out_smoke/metrics/e2e.jsonl`
 - The S3 publisher (`tools/publish_to_s3.sh`) uploads `e2e.jsonl` and `summary_e2e.txt` alongside existing logs/metrics.
+
+Observability checklist (quick sanity during a run)
+- Tail wrapper logs:
+  - `tail -n 120 /data/s2_out_smoke/s2_<PARTITION>_detail.log`
+  - `tail -n 80 /data/s2_npys_smoke/s2_stack_wrapper.log`
+- Summaries (always fresh per wrapper run):
+  - `python tessera_preprocessing/tools/summarize_metrics.py --metrics /data/s2_out_smoke/metrics/s2_metrics.jsonl`
+  - `python tessera_preprocessing/tools/summarize_e2e.py --e2e /data/s2_out_smoke/metrics/e2e.jsonl`
+- Dask report (HTML): `/data/s2_out_smoke/dask-report-<PARTITION>.html`
+
+Notes on dates and metrics files
+- Date-only `--start/--end` cover full days in UTC: start at `T00:00:00Z` and end at the next midnight (exclusive). For a single day you can use `--start 2024-04-16 --end 2024-04-16`.
+- The wrapper truncates `metrics/s2_metrics.jsonl` and `metrics/e2e.jsonl` at start, so each run’s summaries reflect only the current run. If you need to manually clear them before re-running, use:
+  - `: > /data/s2_out_smoke/metrics/s2_metrics.jsonl && : > /data/s2_out_smoke/metrics/e2e.jsonl`
+
+Optional cleanup
+- Add `--cleanup-mosaics 1` to remove the per-band mosaics (blue/green/red/…/scl) under `--local-root` after a successful stack + validation. Temporary directories created under `/tmp` are already cleaned by the CPU step.
 
 ## Downstream tasks
 

@@ -34,7 +34,8 @@ Usage: $0 \
   --local-root PATH --npys-out PATH --partition ID \
   [--s3 s3://bucket/prefix] [--s3-npys s3://bucket/prefix] \
   [--dask-workers N] [--worker-mem GB] [--threads N] [--chunksize N] \
-  [--mem-guard-frac F] [--min-coverage PCT] [--stac-endpoint URL] [--stac-collection ID]
+  [--mem-guard-frac F] [--min-coverage PCT] [--stac-endpoint URL] [--stac-collection ID] \
+  [--cleanup-mosaics 0|1]
 USAGE
 }
 
@@ -42,6 +43,7 @@ USAGE
 ROI_TIFF=""; START=""; END=""; LOCAL_ROOT=""; NPYS_OUT=""; PARTITION=""
 S3_PREFIX=""; S3_NPYS_PREFIX=""
 DASK_WORKERS=1; WORKER_MEM=16; THREADS=4; CHUNKSIZE=256; MEM_GUARD_FRAC=0.9; MIN_COV=0
+CLEANS=0
 STAC_ENDPOINT="https://earth-search.aws.element84.com/v1"; STAC_COLLECTION="sentinel-2-l2a"
 
 while [[ $# -gt 0 ]]; do
@@ -62,6 +64,7 @@ while [[ $# -gt 0 ]]; do
     --min-coverage) MIN_COV="$2"; shift 2;;
     --stac-endpoint) STAC_ENDPOINT="$2"; shift 2;;
     --stac-collection) STAC_COLLECTION="$2"; shift 2;;
+    --cleanup-mosaics) CLEANS="$2"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1;;
   esac
@@ -154,6 +157,21 @@ if [[ -n "$S3_NPYS_PREFIX" ]]; then
   else
     echo "[run_s2_smoke_e2e] Upload NPYs to S3…"
     aws s3 sync "$NPYS_OUT/" "${S3_NPYS_PREFIX%/}/${PARTITION}/${RUN_ID}/" --only-show-errors --no-progress
+  fi
+fi
+
+# Optional: cleanup mosaics after successful stack and validation
+if [[ "$CLEANS" == "1" ]]; then
+  if [[ -f "$NPYS_OUT/bands.npy" && -f "$NPYS_OUT/masks.npy" ]]; then
+    echo "[run_s2_smoke_e2e] Cleanup enabled: removing per-band mosaics under $LOCAL_ROOT"
+    # Restrictive allowlist: only remove known band dirs produced by s2_fast_processor
+    for d in blue green red rededge1 rededge2 rededge3 nir nir08 swir16 swir22 scl; do
+      if [[ -d "$LOCAL_ROOT/$d" ]]; then
+        rm -rf "$LOCAL_ROOT/$d"
+      fi
+    done
+  else
+    echo "[run_s2_smoke_e2e] Cleanup requested but NPYs not found; skipping deletion" >&2
   fi
 fi
 
