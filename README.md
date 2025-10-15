@@ -545,7 +545,8 @@ Tuning for more days
 
 End‑to‑end metrics (optional, included in wrapper)
 
-- The wrapper now records step metrics for both phases to `e2e.jsonl` under `--local-root/metrics/` via `tessera_preprocessing/tools/measure_subprocess.py`. It tracks per‑step wall time, approximate proc‑tree CPU seconds, max RSS across the process tree, and bytes written under the tracked output directories.
+- The wrapper now records step metrics for both phases to `e2e.jsonl` under `--local-root/metrics/` via `tessera_preprocessing/tools/measure_subprocess.py`. It tracks per‑step wall time, approximate proc‑tree CPU seconds, max RSS across the process tree, and filesystem deltas under the tracked output directories.
+  - Bytes are reported three ways at step end: `bytesΔ` (net change = created − removed), `created/grown` and `removed/shrunk`. A negative `bytesΔ` simply means the step deleted more than it wrote (e.g., regenerating SCL or replacing invalid mosaics).
 - Validate the stacked NPYs and capture their shapes with `tessera_preprocessing/tools/validate_s2_npys.py`. The wrapper appends a `npy_validate` event to `e2e.jsonl` and prints a one‑line summary.
 - To summarize end‑to‑end, use:
   - `python tessera_preprocessing/tools/summarize_e2e.py --e2e /data/s2_out_smoke/metrics/e2e.jsonl`

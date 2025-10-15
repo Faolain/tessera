@@ -22,20 +22,34 @@ def parse_args():
     return ap.parse_args()
 
 
-def dir_size_bytes(root: Optional[str]) -> int:
+def dir_snapshot(root: Optional[str]) -> Dict[str, int]:
+    """Return a mapping of relative file path -> size for all files under root.
+
+    Used to estimate bytes created/removed/grown/shrunk across a step.
+    """
+    snap: Dict[str, int] = {}
     if not root:
-        return 0
+        return snap
     p = Path(root)
     if not p.exists():
-        return 0
-    total = 0
-    for sub in p.rglob("*"):
-        try:
-            if sub.is_file():
-                total += sub.stat().st_size
-        except Exception:
-            continue
-    return total
+        return snap
+    try:
+        for sub in p.rglob("*"):
+            try:
+                if sub.is_file():
+                    # store as posix relative to keep paths stable across hosts
+                    rel = sub.relative_to(p).as_posix()
+                    snap[rel] = int(sub.stat().st_size)
+            except Exception:
+                continue
+    except Exception:
+        # best-effort; return what we have
+        pass
+    return snap
+
+def dir_size_bytes(root: Optional[str]) -> int:
+    snap = dir_snapshot(root)
+    return sum(snap.values())
 
 
 def proc_tree(p: psutil.Process) -> List[psutil.Process]:  # type: ignore
@@ -100,7 +114,8 @@ def main():
     jsonl = Path(a.jsonl)
     jsonl.parent.mkdir(parents=True, exist_ok=True)
 
-    before_bytes = dir_size_bytes(a.bytes_root)
+    before_map = dir_snapshot(a.bytes_root)
+    before_bytes = sum(before_map.values())
     start_ts = time.time()
     rec_start = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ts)),
@@ -144,8 +159,37 @@ def main():
             stop_evt.set()
             mon.join(timeout=2)
 
-        after_bytes = dir_size_bytes(a.bytes_root)
+        after_map = dir_snapshot(a.bytes_root)
+        after_bytes = sum(after_map.values())
         bytes_delta = after_bytes - before_bytes if a.bytes_root else None
+
+        # Derive created/removed and grown/shrunk estimates to explain negative deltas
+        bytes_created = 0
+        bytes_removed = 0
+        files_created = 0
+        files_deleted = 0
+        files_grew = 0
+        files_shrunk = 0
+        if a.bytes_root:
+            # created and deleted
+            before_keys = set(before_map.keys())
+            after_keys = set(after_map.keys())
+            created = after_keys - before_keys
+            deleted = before_keys - after_keys
+            files_created = len(created)
+            files_deleted = len(deleted)
+            bytes_created += sum(after_map[k] for k in created)
+            bytes_removed += sum(before_map[k] for k in deleted)
+            # grown/shrunk for common files
+            common = before_keys & after_keys
+            for k in common:
+                b = before_map[k]; a_ = after_map[k]
+                if a_ > b:
+                    bytes_created += (a_ - b)
+                    files_grew += 1
+                elif b > a_:
+                    bytes_removed += (b - a_)
+                    files_shrunk += 1
 
         rec_end = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_ts)),
@@ -159,6 +203,12 @@ def main():
             "io_read_bytes_max": state.get("io_read_bytes_max"),
             "io_write_bytes_max": state.get("io_write_bytes_max"),
             "bytes_delta": bytes_delta,
+            "bytes_written_est": bytes_created,
+            "bytes_removed_est": bytes_removed,
+            "files_created": files_created,
+            "files_deleted": files_deleted,
+            "files_grew": files_grew,
+            "files_shrunk": files_shrunk,
             "tail": last_lines,
         }
         with jsonl.open("a", encoding="utf-8") as fh:

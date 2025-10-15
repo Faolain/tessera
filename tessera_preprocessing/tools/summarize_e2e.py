@@ -43,12 +43,14 @@ def main():
             name = ev.get("name")
             if not name:
                 continue
-            d = steps.setdefault(name, {"wall": 0.0, "cpu": 0.0, "rss": 0, "bytes": 0, "n": 0})
+            d = steps.setdefault(name, {"wall": 0.0, "cpu": 0.0, "rss": 0, "bytes": 0, "bytes_written": 0, "bytes_removed": 0, "n": 0})
             if ev.get("event") == "step_end":
                 d["wall"] += float(ev.get("wall_s") or 0.0)
                 d["cpu"] = max(d["cpu"], float(ev.get("cpu_total_s_approx") or 0.0))
                 d["rss"] = max(d["rss"], int(ev.get("rss_bytes_max_sum") or 0))
                 d["bytes"] += int(ev.get("bytes_delta") or 0)
+                d["bytes_written"] += int(ev.get("bytes_written_est") or 0)
+                d["bytes_removed"] += int(ev.get("bytes_removed_est") or 0)
                 d["n"] += 1
 
     print("=== TESSERA E2E Summary ===")
@@ -63,10 +65,16 @@ def main():
     max_rss = max([v["rss"] for v in steps.values()] + [0])
     print(f"Max RSS observed across steps: {max_rss/(1024**3):.2f} GiB")
     total_bytes = sum(v["bytes"] for v in steps.values())
+    total_written = sum(v["bytes_written"] for v in steps.values())
+    total_removed = sum(v["bytes_removed"] for v in steps.values())
     print(f"Bytes written delta (tracked roots): {total_bytes/(1024**3):.2f} GiB")
+    print(f"  ↳ Created/grown: {total_written/(1024**3):.2f} GiB | Removed/shrunk: {total_removed/(1024**3):.2f} GiB")
     print("")
     for k, v in steps.items():
-        print(f"Step {k}: wall {v['wall']/3600.0:.2f} h | cpu {v['cpu']/3600.0:.2f} h | maxRSS {v['rss']/(1024**3):.2f} GiB | bytes {v['bytes']/(1024**3):.2f} GiB (n={v['n']})")
+        print(
+            f"Step {k}: wall {v['wall']/3600.0:.2f} h | cpu {v['cpu']/3600.0:.2f} h | maxRSS {v['rss']/(1024**3):.2f} GiB | "
+            f"bytesΔ {v['bytes']/(1024**3):.2f} GiB (created {v['bytes_written']/(1024**3):.2f} GiB, removed {v['bytes_removed']/(1024**3):.2f} GiB) (n={v['n']})"
+        )
     return 0
 
 
