@@ -35,7 +35,7 @@ Usage: $0 \
   [--s3 s3://bucket/prefix] [--s3-npys s3://bucket/prefix] \
   [--dask-workers N] [--worker-mem GB] [--threads N] [--chunksize N] \
   [--mem-guard-frac F] [--min-coverage PCT] [--stac-endpoint URL] [--stac-collection ID] \
-  [--cleanup-mosaics 0|1]
+  [--cleanup-mosaics 0|1] [--delete-local 0|1] [--delete-local-npys 0|1] [--npys-nested 0|1]
 USAGE
 }
 
@@ -43,7 +43,7 @@ USAGE
 ROI_TIFF=""; START=""; END=""; LOCAL_ROOT=""; NPYS_OUT=""; PARTITION=""
 S3_PREFIX=""; S3_NPYS_PREFIX=""
 DASK_WORKERS=1; WORKER_MEM=16; THREADS=4; CHUNKSIZE=256; MEM_GUARD_FRAC=0.9; MIN_COV=0
-CLEANS=0
+CLEANS=0; DELETE_LOCAL=0; DELETE_LOCAL_NPYS=0; NPYS_NESTED=0
 STAC_ENDPOINT="https://earth-search.aws.element84.com/v1"; STAC_COLLECTION="sentinel-2-l2a"
 
 while [[ $# -gt 0 ]]; do
@@ -65,6 +65,9 @@ while [[ $# -gt 0 ]]; do
     --stac-endpoint) STAC_ENDPOINT="$2"; shift 2;;
     --stac-collection) STAC_COLLECTION="$2"; shift 2;;
     --cleanup-mosaics) CLEANS="$2"; shift 2;;
+    --delete-local) DELETE_LOCAL="$2"; shift 2;;
+    --delete-local-npys) DELETE_LOCAL_NPYS="$2"; shift 2;;
+    --npys-nested) NPYS_NESTED="$2"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1;;
   esac
@@ -75,7 +78,14 @@ if [[ -z "$ROI_TIFF" || -z "$START" || -z "$END" || -z "$LOCAL_ROOT" || -z "$NPY
 fi
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$LOCAL_ROOT" "$NPYS_OUT" "$LOCAL_ROOT/metrics" || true
+mkdir -p "$LOCAL_ROOT" "$LOCAL_ROOT/metrics" || true
+
+# Determine local NPY destination (flat by default; nested mirrors S3)
+NPYS_DEST="$NPYS_OUT"
+if [[ "$NPYS_NESTED" == "1" ]]; then
+  NPYS_DEST="$NPYS_OUT/${PARTITION}/${RUN_ID}"
+fi
+mkdir -p "$NPYS_DEST" || true
 
 # Always start a fresh E2E metrics file per wrapper run
 E2E_JSONL="$LOCAL_ROOT/metrics/e2e.jsonl"
@@ -121,11 +131,11 @@ echo "[run_s2_smoke_e2e] Phase 2/3: Stack TIFFs → NPYs…"
 python tessera_preprocessing/tools/measure_subprocess.py \
   --jsonl "$E2E_JSONL" \
   --name s2_stack \
-  --bytes-root "$NPYS_OUT" \
-  --log "$NPYS_OUT/s2_stack_wrapper.log" -- \
+  --bytes-root "$NPYS_DEST" \
+  --log "$NPYS_DEST/s2_stack_wrapper.log" -- \
   ./tessera_preprocessing/s2_stack \
     --input "$LOCAL_ROOT" \
-    --output "$NPYS_OUT" \
+    --output "$NPYS_DEST" \
     --batch-size 8 --cache-level 1 --num-threads "$((THREADS*2))" --sample-rate 1
 
 if [[ -f tessera_preprocessing/tools/summarize_metrics.py ]]; then
@@ -135,7 +145,7 @@ fi
 
 # Record NPY validation and E2E summary if tools available
 if [[ -f tessera_preprocessing/tools/validate_s2_npys.py ]]; then
-  python tessera_preprocessing/tools/validate_s2_npys.py --npys "$NPYS_OUT" --jsonl "$E2E_JSONL" || true
+  python tessera_preprocessing/tools/validate_s2_npys.py --npys "$NPYS_DEST" --jsonl "$E2E_JSONL" || true
 fi
 if [[ -f tessera_preprocessing/tools/summarize_e2e.py ]]; then
   echo "[run_s2_smoke_e2e] E2E summary:"
@@ -148,7 +158,8 @@ if [[ -n "$S3_PREFIX" ]]; then
     --local-root "$LOCAL_ROOT" \
     --partition-id "$PARTITION" \
     --s3 "$S3_PREFIX" \
-    --upload-outputs 0
+    --upload-outputs 0 \
+    --delete-local "$DELETE_LOCAL"
 fi
 
 if [[ -n "$S3_NPYS_PREFIX" ]]; then
@@ -156,13 +167,13 @@ if [[ -n "$S3_NPYS_PREFIX" ]]; then
     echo "awscli not found; skipping NPY upload" >&2
   else
     echo "[run_s2_smoke_e2e] Upload NPYs to S3…"
-    aws s3 sync "$NPYS_OUT/" "${S3_NPYS_PREFIX%/}/${PARTITION}/${RUN_ID}/" --only-show-errors --no-progress
+    aws s3 sync "$NPYS_DEST/" "${S3_NPYS_PREFIX%/}/${PARTITION}/${RUN_ID}/" --only-show-errors --no-progress
   fi
 fi
 
 # Optional: cleanup mosaics after successful stack and validation
 if [[ "$CLEANS" == "1" ]]; then
-  if [[ -f "$NPYS_OUT/bands.npy" && -f "$NPYS_OUT/masks.npy" ]]; then
+  if [[ -f "$NPYS_DEST/bands.npy" && -f "$NPYS_DEST/masks.npy" ]]; then
     echo "[run_s2_smoke_e2e] Cleanup enabled: removing per-band mosaics under $LOCAL_ROOT"
     # Restrictive allowlist: only remove known band dirs produced by s2_fast_processor
     for d in blue green red rededge1 rededge2 rededge3 nir nir08 swir16 swir22 scl; do
@@ -175,4 +186,14 @@ if [[ "$CLEANS" == "1" ]]; then
   fi
 fi
 
-echo "[run_s2_smoke_e2e] Done. Local NPYs at: $NPYS_OUT"
+# Optional: delete local NPYs (use with --npys-nested 1 to scope to this run)
+if [[ "$DELETE_LOCAL_NPYS" == "1" ]]; then
+  if [[ -d "$NPYS_DEST" ]]; then
+    echo "[run_s2_smoke_e2e] Deleting local NPYs at: $NPYS_DEST"
+    rm -rf "$NPYS_DEST"
+  else
+    echo "[run_s2_smoke_e2e] --delete-local-npys set but target not found: $NPYS_DEST" >&2
+  fi
+fi
+
+echo "[run_s2_smoke_e2e] Done. Local NPYs at: $NPYS_DEST"

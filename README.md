@@ -535,7 +535,7 @@ bash tessera_preprocessing/tools/run_s2_smoke_e2e.sh \
   --s3 s3://tessera-test1/tessera/s2 \
   --s3-npys s3://tessera-test1/tessera/s2_npys \
   --dask-workers 1 --worker-mem 16 --threads 4 --chunksize 256 --mem-guard-frac 0.9 \
-  [--cleanup-mosaics 0|1]
+  [--cleanup-mosaics 0|1] [--delete-local 0|1] [--delete-local-npys 0|1] [--npys-nested 0|1]
 ```
 
 Tuning for more days
@@ -567,6 +567,12 @@ Notes on dates and metrics files
 
 Optional cleanup
 - Add `--cleanup-mosaics 1` to remove the per-band mosaics (blue/green/red/…/scl) under `--local-root` after a successful stack + validation. Temporary directories created under `/tmp` are already cleaned by the CPU step.
+- Add `--delete-local 1` to the publisher call (wrapper forwards this) to delete almost everything under `--local-root` after logs/metrics are uploaded to S3.
+- Add `--npys-nested 1` to write local NPYs under `--npys-out/<PARTITION>/<RUN_ID>/` (mirrors S3 layout). Combine with `--delete-local-npys 1` to delete only that subfolder after upload/validation.
+
+Local and S3 layout guidance
+- Recommended local layout during benchmarking: keep `--local-root` flat for logs/metrics; set `--npys-nested 1` so each run’s arrays go to `--npys-out/<PARTITION>/<RUN_ID>/`.
+- S3 layout is already versioned: `<s3_npys_prefix>/<PARTITION>/<RUN_ID>/`. Keep per‑run directories for reproducibility, and configure an S3 lifecycle rule to expire old runs (e.g., retain 7–30 days). If you also want a stable “latest” view, sync the same NPYs to `<s3_npys_prefix>/<PARTITION>/latest/` after each run.
 
 ## Downstream tasks
 
