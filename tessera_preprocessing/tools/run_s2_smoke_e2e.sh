@@ -78,6 +78,10 @@ mkdir -p "$LOCAL_ROOT" "$NPYS_OUT" "$LOCAL_ROOT/metrics" || true
 E2E_JSONL="$LOCAL_ROOT/metrics/e2e.jsonl"
 : > "$E2E_JSONL"
 
+# Start a fresh S2 CPU metrics file for this wrapper run
+S2_JSONL="$LOCAL_ROOT/metrics/s2_metrics.jsonl"
+: > "$S2_JSONL"
+
 # Conservative, safe defaults for small instances
 export TMPDIR="${TMPDIR:-/tmp}"
 export TEMP_DIR="${TEMP_DIR:-$TMPDIR}"
@@ -108,7 +112,7 @@ python tessera_preprocessing/tools/measure_subprocess.py \
     --min_coverage "$MIN_COV" \
     --stac_endpoint "$STAC_ENDPOINT" --stac_collection "$STAC_COLLECTION" \
     --partition_id "$PARTITION" \
-    --metrics_jsonl "$LOCAL_ROOT/metrics/s2_metrics.jsonl"
+    --metrics_jsonl "$S2_JSONL"
 
 echo "[run_s2_smoke_e2e] Phase 2/3: Stack TIFFs → NPYs…"
 python tessera_preprocessing/tools/measure_subprocess.py \

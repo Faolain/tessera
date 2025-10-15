@@ -21,6 +21,35 @@ def main():
         print(f"Metrics file not found: {p}", file=sys.stderr)
         sys.exit(2)
 
+    # Load all events
+    events = []
+    with p.open() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            ev_ts = iso(ev.get("ts"))
+            events.append((ev_ts, ev))
+
+    if not events:
+        print("No events found.")
+        return 0
+
+    # Find the last run segment: from last run_start to EOF
+    last_start_idx = None
+    for i, (ts, ev) in enumerate(events):
+        if ev.get("event") == "run_start":
+            last_start_idx = i
+    if last_start_idx is None:
+        # Fallback: use the whole file
+        last_start_idx = 0
+    seg = events[last_start_idx:]
+
+    # Accumulate over the selected segment only
     run = {"start": None, "end": None, "args": {}, "roi": {}}
     days = []
     scl_pcts = []
@@ -31,49 +60,44 @@ def main():
     cpu_total_s = None
     max_rss_seen = 0
 
-    with p.open() as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except Exception:
-                continue
-            ts = iso(ev.get("ts"))
-            if ts:
-                first_ts = ts if first_ts is None else min(first_ts, ts)
-                last_ts = ts if last_ts is None else max(last_ts, ts)
-            e = ev.get("event")
-            if e == "run_start":
-                run["start"] = ts
-                run["args"] = ev.get("args", {})
-                run["roi"] = ev.get("roi", {})
-            elif e == "run_end":
-                run["end"] = ts
-                proc = ev.get("proc") or {}
-                cpu_total_s = proc.get("cpu_total_s", cpu_total_s)
-                max_rss_seen = max(max_rss_seen, int(proc.get("max_rss_bytes_seen", 0)))
-            elif e == "day_end":
-                days.append(ev)
-                total_bytes += int(ev.get("bytes_written", 0) or 0)
-                total_wall += float(ev.get("wall_s", 0.0) or 0.0)
-                if ev.get("scl_valid_pct") is not None:
-                    try:
-                        scl_pcts.append(float(ev.get("scl_valid_pct")))
-                    except Exception:
-                        pass
-            else:
-                # harvest max RSS if present
-                proc = ev.get("proc") or {}
-                max_rss_seen = max(max_rss_seen, int(proc.get("max_rss_bytes_seen", 0)))
+    for ts, ev in seg:
+        if ts:
+            first_ts = ts if first_ts is None else min(first_ts, ts)
+            last_ts = ts if last_ts is None else max(last_ts, ts)
+        e = ev.get("event")
+        if e == "run_start":
+            run["start"] = ts
+            run["args"] = ev.get("args", {})
+            run["roi"] = ev.get("roi", {})
+        elif e == "run_end":
+            run["end"] = ts
+            proc = ev.get("proc") or {}
+            cpu_total_s = proc.get("cpu_total_s", cpu_total_s)
+            max_rss_seen = max(max_rss_seen, int(proc.get("max_rss_bytes_seen", 0)))
+        elif e == "day_end":
+            days.append(ev)
+            total_bytes += int(ev.get("bytes_written", 0) or 0)
+            total_wall += float(ev.get("wall_s", 0.0) or 0.0)
+            if ev.get("scl_valid_pct") is not None:
+                try:
+                    scl_pcts.append(float(ev.get("scl_valid_pct")))
+                except Exception:
+                    pass
+        else:
+            # harvest max RSS if present
+            proc = ev.get("proc") or {}
+            max_rss_seen = max(max_rss_seen, int(proc.get("max_rss_bytes_seen", 0)))
 
-    # Fallbacks
+    # Compute walls
     wall_elapsed = None
     if run["start"] and run["end"]:
         wall_elapsed = (run["end"] - run["start"]).total_seconds()
     elif first_ts and last_ts:
         wall_elapsed = (last_ts - first_ts).total_seconds()
+
+    # Guard against negative (e.g., mixed runs)
+    if wall_elapsed is not None and wall_elapsed < 0:
+        wall_elapsed = 0.0
 
     days_success = sum(1 for d in days if d.get("success"))
     days_total = len(days)
@@ -117,4 +141,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
