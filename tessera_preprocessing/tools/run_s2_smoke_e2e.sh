@@ -74,6 +74,10 @@ fi
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$LOCAL_ROOT" "$NPYS_OUT" "$LOCAL_ROOT/metrics" || true
 
+# Always start a fresh E2E metrics file per wrapper run
+E2E_JSONL="$LOCAL_ROOT/metrics/e2e.jsonl"
+: > "$E2E_JSONL"
+
 # Conservative, safe defaults for small instances
 export TMPDIR="${TMPDIR:-/tmp}"
 export TEMP_DIR="${TEMP_DIR:-$TMPDIR}"
@@ -90,7 +94,7 @@ export NUMEXPR_MAX_THREADS=${NUMEXPR_MAX_THREADS:-1}
 
 echo "[run_s2_smoke_e2e] Phase 1/3: CPU preprocessing…"
 python tessera_preprocessing/tools/measure_subprocess.py \
-  --jsonl "$LOCAL_ROOT/metrics/e2e.jsonl" \
+  --jsonl "$E2E_JSONL" \
   --name s2_cpu \
   --bytes-root "$LOCAL_ROOT" \
   --log "$LOCAL_ROOT/s2_cpu_wrapper.log" -- \
@@ -108,7 +112,7 @@ python tessera_preprocessing/tools/measure_subprocess.py \
 
 echo "[run_s2_smoke_e2e] Phase 2/3: Stack TIFFs → NPYs…"
 python tessera_preprocessing/tools/measure_subprocess.py \
-  --jsonl "$LOCAL_ROOT/metrics/e2e.jsonl" \
+  --jsonl "$E2E_JSONL" \
   --name s2_stack \
   --bytes-root "$NPYS_OUT" \
   --log "$NPYS_OUT/s2_stack_wrapper.log" -- \
@@ -124,11 +128,11 @@ fi
 
 # Record NPY validation and E2E summary if tools available
 if [[ -f tessera_preprocessing/tools/validate_s2_npys.py ]]; then
-  python tessera_preprocessing/tools/validate_s2_npys.py --npys "$NPYS_OUT" --jsonl "$LOCAL_ROOT/metrics/e2e.jsonl" || true
+  python tessera_preprocessing/tools/validate_s2_npys.py --npys "$NPYS_OUT" --jsonl "$E2E_JSONL" || true
 fi
 if [[ -f tessera_preprocessing/tools/summarize_e2e.py ]]; then
   echo "[run_s2_smoke_e2e] E2E summary:"
-  python tessera_preprocessing/tools/summarize_e2e.py --e2e "$LOCAL_ROOT/metrics/e2e.jsonl" || true
+  python tessera_preprocessing/tools/summarize_e2e.py --e2e "$E2E_JSONL" || true
 fi
 
 if [[ -n "$S3_PREFIX" ]]; then

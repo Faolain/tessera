@@ -53,7 +53,11 @@ def main():
 
     print("=== TESSERA E2E Summary ===")
     if first and last:
-        print(f"End-to-end wall: {(last-first).total_seconds()/3600.0:.2f} h (first→last record)")
+        wall_fl = (last-first).total_seconds()
+        print(f"End-to-end wall: {wall_fl/3600.0:.2f} h (first→last record)")
+    # Also report the sum of step walls (excludes idle gaps between steps)
+    step_wall_sum = sum(v["wall"] for v in steps.values())
+    print(f"Combined step wall (sum of steps): {step_wall_sum/3600.0:.2f} h")
     total_cpu = sum(v["cpu"] for v in steps.values())
     print(f"Aggregate CPU (approx proc-tree): {total_cpu/3600.0:.2f} h")
     max_rss = max([v["rss"] for v in steps.values()] + [0])
@@ -68,4 +72,3 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
