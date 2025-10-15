@@ -554,8 +554,12 @@ End‑to‑end metrics (optional, included in wrapper)
 
 Observability checklist (quick sanity during a run)
 - Tail wrapper logs:
-  - `tail -n 120 /data/s2_out_smoke/s2_<PARTITION>_detail.log`
-  - `tail -n 80 /data/s2_npys_smoke/s2_stack_wrapper.log`
+  - Live (while the run is executing): `tail -n 120 /data/s2_out_smoke/s2_<PARTITION>_detail.log`
+  - After publish with `--delete-local 1` (top-level log removed), find the most recent export and tail from there:
+    `tail -n 120 "$(ls -1dt /data/s2_out_smoke/_run_exports/*_\<PARTITION\>/ | head -n1)s2_\<PARTITION\>_detail.log"`
+  - Stack log (flat): `tail -n 80 /data/s2_npys_smoke/s2_stack_wrapper.log`
+  - Stack log (nested with `--npys-nested 1`):
+    `tail -n 80 "$(ls -1dt /data/s2_npys_smoke/<PARTITION>/*/ | head -n1)s2_stack_wrapper.log"`
 - Summaries (always fresh per wrapper run):
   - `python tessera_preprocessing/tools/summarize_metrics.py --metrics /data/s2_out_smoke/metrics/s2_metrics.jsonl`
   - `python tessera_preprocessing/tools/summarize_e2e.py --e2e /data/s2_out_smoke/metrics/e2e.jsonl`
@@ -565,6 +569,9 @@ Notes on dates and metrics files
 - Date-only `--start/--end` cover full days in UTC: start at `T00:00:00Z` and end at the next midnight (exclusive). For a single day you can use `--start 2024-04-16 --end 2024-04-16`.
 - The wrapper truncates `metrics/s2_metrics.jsonl` and `metrics/e2e.jsonl` at start, so each run’s summaries reflect only the current run. If you need to manually clear them before re-running, use:
   - `: > /data/s2_out_smoke/metrics/s2_metrics.jsonl && : > /data/s2_out_smoke/metrics/e2e.jsonl`
+  - If you passed `--delete-local 1`, the top-level logs and metrics are removed after publish; a copy is archived under
+    `/data/s2_out_smoke/_run_exports/<RUN_ID>_<PARTITION>/`. To reference the latest export in one line:
+    `LATEST=$(ls -1dt /data/s2_out_smoke/_run_exports/*_\<PARTITION\>/ | head -n1)` and then tail/grep under `$LATEST`.
 
 Optional cleanup
 - Add `--cleanup-mosaics 1` to remove the per-band mosaics (blue/green/red/…/scl) under `--local-root` after a successful stack + validation. Temporary directories created under `/tmp` are already cleaned by the CPU step.

@@ -66,6 +66,7 @@ E2E_METRICS="${LOCAL_ROOT}/metrics/e2e.jsonl"
 [[ -f "${E2E_METRICS}" ]] && cp -f "${E2E_METRICS}" "${EXPORT_DIR}/"
 [[ -f "${DASK_REPORT}" ]] && cp -f "${DASK_REPORT}" "${EXPORT_DIR}/"
 
+
 # Optional human-readable summary
 if [[ -f "tessera_preprocessing/tools/summarize_metrics.py" && -f "${METRICS}" ]]; then
   python tessera_preprocessing/tools/summarize_metrics.py --metrics "${METRICS}" > "${EXPORT_DIR}/summary.txt" || true
@@ -106,4 +107,5 @@ if [[ "${DELETE_LOCAL}" == "1" ]]; then
     -exec rm -rf {} +
 fi
 
+echo "Local export archived at: ${EXPORT_DIR}"
 echo "Published to ${BASE_S3}"
