@@ -97,7 +97,7 @@ Paste as user‑data. Adjust variables at the top (bucket/prefix, ROI, dates, si
 
   aws s3 cp "$ROI_TIFF_S3" /data/grids/roi.tiff --no-progress
 
-  # ==== RUN S2 CPU (AWS Earth Search by default) ====
+# ==== RUN S2 CPU (AWS Earth Search by default) ====
 
   python tessera_preprocessing/s2_fast_processor.py \
   --input_tiff /data/grids/roi.tiff \
@@ -166,3 +166,70 @@ Paste as user‑data. Adjust variables at the top (bucket/prefix, ROI, dates, si
 - Enable S3 lifecycle: transition `artifacts/` after N days to Glacier; keep `logs/` and `metrics/` long‑term.
 - Use instance NVMe for `TEMP_DIR` to minimize EBS I/O and size.
 - For many tiles, consider Spot with checkpointing (publish logs incrementally, then terminate).
+
+---
+
+## Optional: Add end‑to‑end benchmark metrics (wrapper; test‑only)
+
+Why: The native S2 processor already logs detailed CPU‑side metrics, but the Rust `s2_stack` phase has no built‑in metrics. If you want coarse, end‑to‑end numbers for tuning (not for auditing), you can wrap both steps with a very light measurer. It records per‑step wall time, approximate proc‑tree CPU seconds, a max RSS sample, and bytes delta under the output directories.
+
+Important caveats
+- These numbers are approximate. Wrapping adds a tiny amount of overhead and uses directory size deltas; pre‑existing files or concurrent writers can skew results.
+- Treat as benchmarking aids only. Do not use as authoritative accounting or for scientific reporting.
+
+Patch (minimal): Replace the two run blocks and add a short summary/validation. Variables below are the same ones defined earlier in this user‑data.
+
+```bash
+# ==== RUN S2 CPU (with wrapper metrics) ====
+python tessera_preprocessing/tools/measure_subprocess.py \
+  --jsonl "$OUT_DIR/metrics/e2e.jsonl" \
+  --name s2_cpu --bytes-root "$OUT_DIR" \
+  --log "$OUT_DIR/s2_cpu_wrapper.log" -- \
+  python tessera_preprocessing/s2_fast_processor.py \
+    --input_tiff /data/grids/roi.tiff \
+    --start_date "$START_DATE" --end_date "$END_DATE" \
+    --output "$OUT_DIR" \
+    --dask_workers "$DASK_WORKERS" --worker_memory "$WORKER_MEMORY_GB" \
+    --chunksize 1024 --resolution 10 \
+    --min_coverage 10 \
+    --partition_id "$PARTITION_ID" \
+    --metrics_jsonl "$OUT_DIR/metrics/s2_metrics.jsonl"
+
+# Optional CPU‑only summary (unchanged)
+python tessera_preprocessing/tools/summarize_metrics.py \
+  --metrics "$OUT_DIR/metrics/s2_metrics.jsonl" \
+  > "$OUT_DIR/metrics/summary.txt" || true
+
+# ==== STACK S2 → NPYs (with wrapper metrics) ====
+python tessera_preprocessing/tools/measure_subprocess.py \
+  --jsonl "$OUT_DIR/metrics/e2e.jsonl" \
+  --name s2_stack --bytes-root "$NPY_DIR" \
+  --log "$NPY_DIR/s2_stack_wrapper.log" -- \
+  ./tessera_preprocessing/s2_stack \
+    --input "$OUT_DIR" \
+    --output "$NPY_DIR" \
+    --batch-size 8 --cache-level 1 --num-threads 8 --sample-rate 1
+
+# Validate stacked NPYs and summarize e2e
+python tessera_preprocessing/tools/validate_s2_npys.py --npys "$NPY_DIR" --jsonl "$OUT_DIR/metrics/e2e.jsonl" || true
+python tessera_preprocessing/tools/summarize_e2e.py --e2e "$OUT_DIR/metrics/e2e.jsonl" > "$OUT_DIR/metrics/summary_e2e.txt" || true
+
+# ==== PUBLISH LOGS/METRICS ONLY (publisher also uploads e2e.jsonl if present) ====
+bash tessera_preprocessing/tools/publish_to_s3.sh \
+  --local-root "$OUT_DIR" \
+  --partition-id "$PARTITION_ID" \
+  --s3 "$S3_LOG_PREFIX" \
+  --upload-outputs 0 \
+  --delete-local 1
+
+# ==== PUBLISH S2 NPYs (unchanged) ====
+aws s3 sync "$NPY_DIR" "${S3_S2_NPY_PREFIX}/${PARTITION_ID}/${RUN_ID}/" \
+  --no-progress --only-show-errors
+```
+
+Alternative: use the one‑shot wrapper
+- Instead of patching the user‑data, call the wrapper which already does all of the above, including e2e metrics and optional S3 uploads:
+  - `bash tessera_preprocessing/tools/run_s2_smoke_e2e.sh --roi_tiff /data/grids/roi.tiff --start "$START_DATE" --end "$END_DATE" --local-root "$OUT_DIR" --npys-out "$NPY_DIR" --partition "$PARTITION_ID" --s3 "$S3_LOG_PREFIX" --s3-npys "$S3_S2_NPY_PREFIX" --dask-workers "$DASK_WORKERS" --worker-mem "$WORKER_MEMORY_GB" --threads 4 --chunksize 256 --mem-guard-frac 0.9`
+
+Disable/Remove
+- Simply delete the three wrapper blocks above to revert to native behavior; CPU‑only metrics remain available via `--metrics_jsonl` and `summarize_metrics.py`.

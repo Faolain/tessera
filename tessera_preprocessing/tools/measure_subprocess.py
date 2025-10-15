@@ -16,7 +16,8 @@ def parse_args():
     ap.add_argument("--bytes-root", default=None, help="Directory whose size delta to report")
     ap.add_argument("--log", default=None, help="Optional path to tee stdout to a log file")
     ap.add_argument("--poll", type=float, default=0.5, help="Polling interval seconds for resource sampling")
-    ap.add_argument("--", dest="cmdsep", action="store_true", help=argparse.SUPPRESS)
+    # Capture everything after the standard option terminator "--"
+    # Do NOT define a "--" flag here; argparse will consume it automatically.
     ap.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run (place after --)")
     return ap.parse_args()
 
@@ -87,7 +88,12 @@ def monitor_proc_tree(p: psutil.Process, poll: float, state: Dict[str, float], s
 
 def main():
     a = parse_args()
-    if not a.cmd:
+    # Argparse normally strips the "--" sentinel; be defensive if it leaks through.
+    cmd = list(a.cmd)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+
+    if not cmd:
         print("Provide command after --", file=sys.stderr)
         return 2
 
@@ -109,7 +115,7 @@ def main():
     log_fp = open(a.log, "a", encoding="utf-8") if a.log else None
     try:
         # run process
-        proc = subprocess.Popen(a.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         # monitor thread (only if psutil available)
         state: Dict[str, float] = {}
         stop_evt = threading.Event()
@@ -168,4 +174,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
