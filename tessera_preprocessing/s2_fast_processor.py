@@ -430,17 +430,29 @@ def search_items(bbox_ll, date_range:str, max_cloud, partition_id: str,
     """
     Search STAC items with enhanced exception handling and retry logic
     """
-    # Parse start and end times
+    # Parse start and end times with day-aware handling.
+    # If the caller provides date-only (YYYY-MM-DD), cover the entire day by
+    # using start at 00:00:00 and end at next day 00:00:00 (exclusive upper bound).
     start_date, end_date = date_range.split("/")
-    
-    # Parse end time and add one second to ensure end time is included
+    def _has_time(s: str) -> bool:
+        return ("T" in s) or (":" in s) or (" " in s)
+    def _norm(s: str) -> str:
+        return s.replace('Z', '+00:00').replace(' ', 'T')
     try:
-        end_dt = datetime.datetime.fromisoformat(end_date.replace('Z', '+00:00').replace(' ', 'T'))
-        end_dt_plus = end_dt + datetime.timedelta(seconds=1)
-        search_date_range = f"{start_date}/{end_dt_plus.isoformat()}"
-    except ValueError:
-        # If time format parsing fails, use original date range
-        logging.warning(f"[{partition_id}] Unable to parse end date format, using original range: {date_range}")
+        if _has_time(start_date):
+            start_dt = datetime.datetime.fromisoformat(_norm(start_date))
+        else:
+            # date-only → midnight UTC of that date
+            start_dt = datetime.datetime.fromisoformat(f"{start_date}T00:00:00+00:00")
+        if _has_time(end_date):
+            # include the provided ending instant by adding 1s
+            end_dt = datetime.datetime.fromisoformat(_norm(end_date)) + datetime.timedelta(seconds=1)
+        else:
+            # date-only → next midnight (exclusive upper bound)
+            end_dt = datetime.datetime.fromisoformat(f"{end_date}T00:00:00+00:00") + datetime.timedelta(days=1)
+        search_date_range = f"{start_dt.isoformat()}/{end_dt.isoformat()}"
+    except Exception:
+        logging.warning(f"[{partition_id}] Unable to normalize date range '{date_range}', using verbatim.")
         search_date_range = date_range
     
     logging.info(f"[{partition_id}] STAC search date range: {search_date_range}")
